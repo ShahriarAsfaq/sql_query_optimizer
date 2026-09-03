@@ -1,0 +1,17 @@
+server:
+  port: 8080
+
+logging:
+  level:
+    com.sqloptimizer.calcite: DEBUG
+    org.apache.calcite: INFO
+    org.springframework.web: INFO
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always

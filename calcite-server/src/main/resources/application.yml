@@ -1,0 +1,20 @@
+server:
+  port: 8080
+
+spring:
+  profiles:
+    active: local
+
+logging:
+  level:
+    com.sqloptimizer.calcite: DEBUG
+    org.apache.calcite: INFO
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always

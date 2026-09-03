@@ -1,0 +1,1 @@
+{"intent_text": "Show top 5 departments by average salary", "schema": {"tables": {"employees": {"columns": {"id": "integer", "name": "text", "department": "text", "salary": "integer"}}, "departments": {"columns": {"id": "integer", "name": "text"}}}}}

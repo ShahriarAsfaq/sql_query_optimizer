@@ -1,0 +1,1 @@
+{"sql": "SELECT * FROM employees WHERE salary > 100000", "dialect": "postgresql", "schema": {"tables": {"employees": {"columns": {"id": {"type": "integer"}, "first_name": {"type": "string"}, "last_name": {"type": "string"}, "salary": {"type": "integer"}, "department_id": {"type": "integer"}}}}}

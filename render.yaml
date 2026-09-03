@@ -1,0 +1,70 @@
+# Render Blueprint for SQL Query Optimizer
+# Deploy with: render deploy --config render.yaml
+
+services:
+  # PostgreSQL database for seed data (EXPLAIN cost scoring)
+  - type: pserv
+    name: sql-optimizer-seed-db
+    plan: free
+    databaseName: sql_optimizer_seed
+    user: postgres
+    region: oregon
+
+  # Backend API
+  - type: web
+    name: sql-optimizer-backend
+    plan: free
+    buildCommand: |
+      pip install -r backend/requirements.txt
+      python backend/manage.py migrate
+    startCommand: |
+      cd backend && gunicorn sql_optimizer.wsgi:application --bind 0.0.0.0:$PORT --workers 2
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: sql_optimizer.settings
+      - key: SEED_DB_HOST
+        fromDatabase:
+          name: sql-optimizer-seed-db
+          property: host
+      - key: SEED_DB_PORT
+        fromDatabase:
+          name: sql-optimizer-seed-db
+          property: port
+      - key: SEED_DB_NAME
+        fromDatabase:
+          name: sql-optimizer-seed-db
+          property: databaseName
+      - key: SEED_DB_USER
+        fromDatabase:
+          name: sql-optimizer-seed-db
+          property: user
+      - key: SEED_DB_PASSWORD
+        fromDatabase:
+          name: sql-optimizer-seed-db
+          property: password
+      - key: DEBUG
+        value: "False"
+      - key: ALLOWED_HOSTS
+        value: "*.onrender.com,localhost,127.0.0.1"
+      - key: CORS_ALLOWED_ORIGINS
+        value: "https://sql-optimizer-frontend.onrender.com,http://localhost:5173,http://localhost:3000"
+    autoDeploy: true
+
+  # Frontend (static site)
+  - type: web
+    name: sql-optimizer-frontend
+    plan: free
+    buildCommand: |
+      cd frontend && npm install && npm run build
+    startCommand: |
+      cd frontend && npx serve -s dist -l $PORT
+    envVars:
+      - key: VITE_API_BASE
+        value: "https://sql-optimizer-backend.onrender.com/api"
+    autoDeploy: true
+
+databases:
+  - name: sql-optimizer-seed-db
+    databaseName: sql_optimizer_seed
+    user: postgres
+    plan: free

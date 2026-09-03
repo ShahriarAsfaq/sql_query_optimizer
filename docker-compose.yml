@@ -1,0 +1,96 @@
+version: '3.8'
+
+services:
+  # PostgreSQL seed database for EXPLAIN cost scoring
+  seed-db:
+    image: postgres:15-alpine
+    container_name: sql_optimizer_seed_db
+    environment:
+      POSTGRES_DB: sql_optimizer_seed
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - seed_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Apache Calcite Optimization Server
+  calcite-server:
+    build:
+      context: ./calcite-server
+      dockerfile: Dockerfile
+    container_name: sql_optimizer_calcite
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - SERVER_PORT=8080
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/calcite/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sql_optimizer_backend
+    environment:
+      - DJANGO_SETTINGS_MODULE=sql_optimizer.settings
+      - SEED_DB_HOST=seed-db
+      - SEED_DB_PORT=5432
+      - SEED_DB_NAME=sql_optimizer_seed
+      - SEED_DB_USER=postgres
+      - SEED_DB_PASSWORD=postgres
+      - CALCITE_SERVER_URL=http://calcite-server:8080
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_MODEL=claude-3-5-sonnet-20241022
+      - DEBUG=True
+      - 'API_KEYS={"dev-key-12345": {"username": "developer", "permissions": ["read", "write", "admin"]}, "test-key-67890": {"username": "tester", "permissions": ["read"]}}'
+    ports:
+      - "8000:8000"
+    depends_on:
+      seed-db:
+        condition: service_healthy
+      calcite-server:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+
+  # Frontend (dev)
+  frontend-dev:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: sql_optimizer_frontend_dev
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_BASE=http://localhost:8000/api
+    depends_on:
+      - backend
+
+  # Frontend (production build with nginx)
+  frontend-prod:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sql_optimizer_frontend_prod
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+
+volumes:
+  seed_db_data:
