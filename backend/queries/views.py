@@ -13,6 +13,67 @@ from django.db import connections
 
 logger = logging.getLogger(__name__)
 
+import re
+
+
+def parse_schema_string(schema_str: str) -> Dict[str, Any]:
+    """
+    Parse schema string format into dict format.
+
+    Input formats supported:
+    - "tables: employees(id, name, salary), departments(id, name)"
+    - "table: users(id, email, password)"
+    - "employees(id, name, salary), departments(id, name)"
+    - "employees(id, name, salary)"
+    - "tables: customers(id, name), orders(id, customer_id); relationships: customers.id -> orders.customer_id"
+
+    Output: {"tables": {"employees": {"columns": {"id": "integer", "name": "text", "salary": "numeric"}}, ...}, "relationships": [...]}
+    """
+    result = {"tables": {}, "relationships": []}
+
+    # Try to extract tables part with "tables:" or "table:" prefix
+    tables_match = re.search(r'tables?:\s*(.+?)(?:\s*;|$)', schema_str, re.IGNORECASE)
+    if tables_match:
+        tables_part = tables_match.group(1)
+    else:
+        # Assume the whole string is the tables part
+        tables_part = schema_str
+
+    # Parse each table: table_name(col1, col2, ...)
+    table_pattern = r'(\w+)\s*\(([^)]+)\)'
+    for match in re.finditer(table_pattern, tables_part):
+        table_name = match.group(1)
+        cols_str = match.group(2)
+        columns = {}
+        for col in cols_str.split(','):
+            col = col.strip()
+            if col:
+                # Default to text type if no type specified
+                columns[col] = "text"
+        result["tables"][table_name] = {"columns": columns}
+
+    # Try to extract relationships part
+    rel_match = re.search(r'relationships?:\s*(.+)$', schema_str, re.IGNORECASE)
+    if rel_match:
+        rel_part = rel_match.group(1)
+        # Parse relationships: from_table.from_col -> to_table.to_col
+        rel_pattern = r'(\w+)\.(\w+)\s*(?:->|->>)\s*(\w+)\.(\w+)'
+        for match in re.finditer(rel_pattern, rel_part):
+            from_table = match.group(1)
+            from_col = match.group(2)
+            to_table = match.group(3)
+            to_col = match.group(4)
+            result["relationships"].append({
+                "from_table": from_table,
+                "from_column": from_col,
+                "to_table": to_table,
+                "to_column": to_col,
+                "type": "one_to_many"
+            })
+
+    return result
+
+
 from .serializers import (
     AnalyzeRequestSerializer, AnalyzeResponseSerializer,
     OptimizeRequestSerializer, OptimizeResponseSerializer,
@@ -53,24 +114,31 @@ class AnalyzeQueryView(APIView):
         parsed = parser.parse(sql)
         parsed_json = parser.format_for_json(parsed)
 
-        # Validate against schema if provided
-        validation_result = {}
-        if schema:
-            validator = ValidationService(schema)
-            validation_result = validator.validate(parsed)
-        else:
-            validation_result = {'is_valid': parsed.is_valid, 'issues': []}
+        # Handle schema: string format -> dict, or infer virtual schema if not provided
+        if isinstance(schema, str):
+            schema = parse_schema_string(schema)
+        elif schema is None:
+            # Infer virtual schema from the parsed SQL
+            schema = parser.build_virtual_schema(parsed)
+
+        # Validate against schema (provided or inferred)
+        validator = ValidationService(schema)
+        validation_result = validator.validate(parsed)
 
         # Check intent match if intent_text provided
         intent_match = None
         if intent_text:
-            intent_service = IntentService()
+            # Use LLMClient with gemini provider to leverage the GOOGLE_API_KEY from .env
+            llm_client = LLMClient(provider='gemini')
+            intent_service = IntentService(llm_client=llm_client)
             intent_match = intent_service.check_intent_match(parsed, intent_text, schema)
 
-        # Generate explanation
+        # Generate explanation - use LLM for syntax error enhancement
+        # Force Gemini provider to avoid system ANTHROPIC_AUTH_TOKEN
+        llm_client = LLMClient(provider='gemini')
         explanation_service = ExplanationService(
             use_llm_intent=explain,
-            llm_client=LLMClient() if explain else None
+            llm_client=llm_client
         )
         explanation = explanation_service.explain(parsed)
 
@@ -79,25 +147,10 @@ class AnalyzeQueryView(APIView):
         if explain:
             try:
                 nl_explanation = explanation_service.explain_intent(parsed, schema)
-                technical_explanation = explanation
 
-                # Also try PostgreSQL EXPLAIN if seed_db available
-                pg_explain_text = ""
-                try:
-                    seed_db = connections['seed_db']
-                    optimizer_with_db = OptimizerService(schema, seed_db_connection=seed_db)
-                    pg_explain = optimizer_with_db._get_explain_plan(sql)
-                    if pg_explain:
-                        pg_explain_text = self._format_pg_explain(pg_explain)
-                except Exception as e:
-                    logger.warning(f"PostgreSQL EXPLAIN failed: {e}")
-
-                # Combine into a single text format
-                explain_plan = nl_explanation
-                if technical_explanation:
-                    explain_plan += "\n\n" + technical_explanation
-                if pg_explain_text:
-                    explain_plan += "\n\nPostgreSQL Execution Plan:\n" + pg_explain_text
+                # Keep only the first line (the natural explanation in one line)
+                if nl_explanation:
+                    explain_plan = nl_explanation.strip().split('\n')[0]
 
             except Exception as e:
                 logger.warning(f"NL explanation generation failed: {e}")
@@ -106,23 +159,11 @@ class AnalyzeQueryView(APIView):
         optimizer = OptimizerService(schema)
         complexity_score = optimizer._compute_complexity_score(parsed, sql)
 
-        # Save to history
-        history_entry = QueryHistory.objects.create(
-            sql=sql,
-            intent_text=intent_text or '',
-            operation_type=parsed.operation_type,
-            parsed_structure=parsed_json,
-            validation_result=validation_result,
-            intent_match=intent_match,
-            explanation=explanation,
-        )
-
         response_data = {
             'parsed_query': parsed_json,
             'validation': validation_result,
             'intent_match': intent_match,
             'explanation': explanation,
-            'history_id': history_entry.id,
             'complexity_score': complexity_score,
             'explain_plan': explain_plan,
         }
@@ -148,6 +189,15 @@ class OptimizeQueryView(APIView):
         sql = serializer.validated_data['sql']
         schema = serializer.validated_data.get('schema')
         use_calcite = serializer.validated_data.get('use_calcite', True)
+
+        # Handle schema: string format -> dict, or infer virtual schema if not provided
+        if isinstance(schema, str):
+            schema = parse_schema_string(schema)
+        elif schema is None:
+            # Infer virtual schema from the parsed SQL
+            parser = get_parser()
+            parsed = parser.parse(sql)
+            schema = parser.build_virtual_schema(parsed)
 
         # Get seed database connection for EXPLAIN
         seed_db = connections['seed_db']
@@ -183,7 +233,9 @@ class GenerateQueryView(APIView):
             # Use a minimal default schema based on common tables if none provided
             schema = self._get_default_schema()
 
-        intent_service = IntentService()
+        # Use LLMClient with gemini provider to leverage the GOOGLE_API_KEY from .env
+        llm_client = LLMClient(provider='gemini')
+        intent_service = IntentService(llm_client=llm_client)
         structured_intent = intent_service.extract_intent(intent_text, schema)
 
         # Apply answers to the structured intent
@@ -207,8 +259,23 @@ class GenerateQueryView(APIView):
         # Use the best candidate (first one) as the primary result
         best_candidate = candidates[0] if candidates else None
         sql = best_candidate.get('sql', '') if best_candidate else ''
-        explanation = f"Generated query for: {structured_intent.get('category', '').lower()} operation"
-        confidence = best_candidate.get('confidence', 0.8) if best_candidate else 0.8
+
+        # Handle category - could be list from LLM, pick first priority
+        category = structured_intent.get('category', '')
+        if isinstance(category, list):
+            priority = ['TOP_N', 'JOIN', 'AGGREGATE', 'FILTER', 'GROUP', 'SORT', 'TREND', 'RANKING', 'DUPLICATE_DETECTION', 'COMPARISON', 'RETRIEVE', 'UNKNOWN']
+            for cat in priority:
+                if cat in category:
+                    category = cat
+                    break
+            else:
+                category = category[0] if category else 'RETRIEVE'
+        explanation = f"Generated query for: {category.lower()} operation"
+
+        # Convert confidence string to float
+        conf_str = best_candidate.get('confidence', 'MEDIUM') if best_candidate else 'MEDIUM'
+        confidence_map = {'HIGH': 0.9, 'MEDIUM': 0.7, 'LOW': 0.4}
+        confidence = confidence_map.get(conf_str, 0.7)
         warnings = best_candidate.get('validation_errors', []) if best_candidate else []
 
         response_data = {

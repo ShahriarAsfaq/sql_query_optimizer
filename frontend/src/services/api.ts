@@ -22,7 +22,7 @@ async function request<T>(endpoint: string, options: RequestOptions = {}): Promi
   // Add API key if available
   const apiKey = localStorage.getItem('apiKey')
   if (apiKey) {
-    (defaultHeaders as Record<string, string>)['Authorization'] = `Api-Key ${apiKey}`
+    (defaultHeaders as Record<string, string>)['Authorization'] = `ApiKey ${apiKey}`
   }
 
   const response = await fetch(url.toString(), {
@@ -43,7 +43,7 @@ export const api = {
   health: () => request<{ status: string; timestamp: string }>('/health/'),
 
   // Analyze query
-  analyze: (sql: string, explain = false) =>
+  analyze: (sql: string, explain = false, schemaContext?: string) =>
     request<{
       parsed_query: {
         operation_type: string
@@ -76,11 +76,11 @@ export const api = {
       explain_plan?: any
     }>('/queries/analyze/', {
       method: 'POST',
-      body: JSON.stringify({ sql, explain }),
+      body: JSON.stringify({ sql, explain, schema: schemaContext }),
     }),
 
   // Optimize query
-  optimize: (sql: string, dialect = 'postgresql') =>
+  optimize: (sql: string, dialect = 'postgresql', schemaContext?: string) =>
     request<{
       original_sql: string
       original_cost: number | null
@@ -102,7 +102,7 @@ export const api = {
       } | null
     }>('/queries/optimize/', {
       method: 'POST',
-      body: JSON.stringify({ sql, dialect }),
+      body: JSON.stringify({ sql, dialect, schema: schemaContext }),
     }),
 
   // Generate SQL from natural language

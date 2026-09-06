@@ -255,6 +255,13 @@ class ExplanationService:
         if not parsed.errors:
             return "Invalid query: Unknown error"
 
+        # Try to get enhanced LLM explanation first
+        if self.llm_client and self.llm_client.is_available():
+            llm_explanation = self._enhance_error_with_llm(parsed)
+            if llm_explanation:
+                return llm_explanation
+
+        # Fallback to rule-based formatting
         lines = []
         lines.append("[ERROR] **Syntax Error(s) Found**")
         lines.append("")
@@ -290,6 +297,61 @@ class ExplanationService:
             lines.append(f"**Tables:** {', '.join(t.name for t in parsed.tables)}")
 
         return "\n".join(lines)
+
+    def _enhance_error_with_llm(self, parsed: ParsedQuery) -> Optional[str]:
+        """
+        Use LLM to provide a more human-friendly explanation of the syntax error.
+
+        Args:
+            parsed: ParsedQuery object with errors
+
+        Returns:
+            Enhanced error explanation or None if LLM fails
+        """
+        if not self.llm_client or not self.llm_client.is_available():
+            return None
+
+        try:
+            # Build context for LLM
+            error_details = []
+            for i, error in enumerate(parsed.errors, 1):
+                detail = f"Error {i}: {error.message}"
+                if error.line is not None:
+                    detail += f" (Line {error.line}"
+                    if error.column is not None:
+                        detail += f", Column {error.column}"
+                    detail += ")"
+                if error.context:
+                    detail += f"\nContext: {error.context.strip()}"
+                error_details.append(detail)
+
+            errors_text = "\n\n".join(error_details)
+
+            prompt = f"""Analyze this SQL syntax error and provide a clear, specific explanation of what's wrong and how to fix it.
+
+SQL Query:
+```sql
+{parsed.raw_sql}
+```
+
+Error Details:
+{errors_text}
+
+Provide a helpful response in this format:
+[ERROR] **What went wrong:** [One clear sentence explaining the exact problem, e.g., "The keyword 'selcet' is misspelled - it should be 'SELECT'"]
+
+[SUGGESTION] **How to fix:** [One clear actionable suggestion, e.g., "Change 'selcet' to 'SELECT'"]
+
+[EXAMPLE] **Correct syntax:** [Show the corrected query or relevant syntax pattern]
+
+Keep it concise and direct. Focus on the specific error, not generic advice."""
+
+            response = self.llm_client.complete(prompt, max_tokens=400, temperature=0.1)
+            return response.strip()
+
+        except Exception as e:
+            logger.warning(f"LLM error enhancement failed: {e}")
+            return None
 
     def _generate_error_hints(self, errors: List[ParseError], sql: str) -> List[str]:
         """Generate helpful hints based on error patterns."""

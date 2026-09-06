@@ -89,14 +89,27 @@ class CandidateQuerySerializer(serializers.Serializer):
     sql = serializers.CharField()
     description = serializers.CharField()
     cost = serializers.FloatField(allow_null=True)
+    startup_cost = serializers.FloatField(allow_null=True)
+    plan_rows = serializers.FloatField(allow_null=True)
+    plan_width = serializers.IntegerField(allow_null=True)
     complexity_score = serializers.FloatField(allow_null=True)
     validation_passed = serializers.BooleanField()
     validation_errors = serializers.ListField(child=serializers.CharField(), required=False)
+    cost_source = serializers.CharField(allow_null=True, required=False)
+    semantic_safety = serializers.CharField(allow_null=True, required=False)
+    semantic_details = serializers.ListField(child=serializers.DictField(), required=False)
+    optimization_reasons = serializers.ListField(child=serializers.CharField(), required=False)
+    confidence = serializers.CharField(allow_null=True, required=False)
+    performance_score = serializers.FloatField(allow_null=True)
+    cost_change_percent = serializers.FloatField(allow_null=True)
+    rewrite_rules_applied = serializers.ListField(child=serializers.CharField(), required=False)
+    plan_analysis = serializers.DictField(allow_null=True, required=False)
 
 
 class OptimizeResponseSerializer(serializers.Serializer):
     original_sql = serializers.CharField()
     original_cost = serializers.FloatField(allow_null=True)
+    original_plan_analysis = serializers.DictField(allow_null=True, required=False)
     candidates = CandidateQuerySerializer(many=True)
     best_candidate = CandidateQuerySerializer(allow_null=True)
 

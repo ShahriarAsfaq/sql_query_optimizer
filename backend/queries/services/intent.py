@@ -102,7 +102,7 @@ class IntentService:
         Initialize intent service.
 
         Args:
-            llm_client: Optional LLM client for NL→intent extraction
+            llm_client: Optional LLM client for NL->intent extraction
         """
         self.llm_client = llm_client
 
@@ -131,29 +131,31 @@ class IntentService:
         """Extract intent using LLM."""
         schema_summary = self._summarize_schema(schema)
 
-        prompt = f"""Extract structured intent from this natural language query.
+        # Get current date for relative time expressions
+        from datetime import datetime
+        current_year = datetime.now().year
+        current_month = datetime.now().month
+        current_day = datetime.now().day
+
+        prompt = f"""Extract intent from NL query. Return ONLY valid JSON.
+
+Current date: {current_year}-{current_month:02d}-{current_day:02d}
 
 Schema:
 {schema_summary}
 
-User request: "{intent_text}"
+Request: "{intent_text}"
 
-Return JSON with these fields:
-- category: one of {', '.join([c.value for c in IntentCategory])}
-- operation: SELECT, COUNT, AVG, SUM, MIN, MAX, etc.
-- entity: main table name from schema
-- metric: column to aggregate (if any)
-- filters: list of {{column, operator, value}}
-- time_range: {{start, end, column}} if date filtering
-- group_by: list of columns
-- order_by: list of {{column, direction}} (ASC/DESC)
-- limit: integer if top N
-- ranking: RANK, DENSE_RANK, ROW_NUMBER if ranking
-- comparison: {{type, entities}} if comparison
+Fields: category (RETRIEVE/FILTER/SORT/AGGREGATE/GROUP/TOP_N/JOIN/TREND/RANKING/DUPLICATE_DETECTION/COMPARISON/UNKNOWN), operation (SELECT/COUNT/AVG/SUM/MIN/MAX), entity (main table), metric (column to aggregate), filters (list of {{column,operator,value}}), time_range (use {{column, start, end}} format for date ranges), group_by, order_by (list of {{column,direction}}), limit, ranking, comparison, join_tables, select_columns.
 
-Return ONLY valid JSON."""
+IMPORTANT:
+- Convert relative time expressions to actual values: "this year" -> {current_year}, "last year" -> {current_year-1}, "this month" -> {current_year}-{current_month:02d}, etc.
+- time_range should be an object like {{"column": "year", "start": "2026", "end": "2026"}} NOT a string
+- filter values should be actual values, not relative expressions
 
-        response = self.llm_client.complete(prompt, max_tokens=800, temperature=0.1)
+JSON:"""
+
+        response = self.llm_client.complete(prompt, max_tokens=2000, temperature=0.1)
 
         # Parse JSON from response
         import json
@@ -194,26 +196,34 @@ Return ONLY valid JSON."""
             if agg_matches >= max_matches:
                 category = IntentCategory.AGGREGATE
 
-        # Override: if query has "top N" or "first N" pattern, prefer TOP_N
-        import re
+        # Detect TOP_N pattern first (for limit extraction and metric handling)
+        is_top_n = False
         if re.search(r'top\s+\d+', text_lower) or re.search(r'first\s+\d+', text_lower):
             category = IntentCategory.TOP_N
+            is_top_n = True
 
-        # Override: if query has JOIN patterns like "X with their Y" or "X and their Y", prefer JOIN
-        if category != IntentCategory.TOP_N and category != IntentCategory.AGGREGATE:
-            join_patterns = [
-                r'\w+\s+with\s+their\s+\w+',
-                r'\w+\s+and\s+their\s+\w+',
-                r'\w+\s+along\s+with\s+their\s+\w+',
-                r'\w+\s+together\s+with\s+their\s+\w+',
-            ]
-            for pattern in join_patterns:
-                if re.search(pattern, text_lower):
+        # Check for JOIN patterns like "X with their Y" or "X and their Y"
+        # This applies even for TOP_N queries where the user wants joined data (e.g., "top 5 employees with their departments")
+        join_patterns = [
+            r'\w+\s+with\s+their\s+\w+',
+            r'\w+\s+and\s+their\s+\w+',
+            r'\w+\s+along\s+with\s+their\s+\w+',
+            r'\w+\s+together\s+with\s+their\s+\w+',
+        ]
+        has_join_pattern = False
+        for pattern in join_patterns:
+            if re.search(pattern, text_lower):
+                has_join_pattern = True
+                # If not already TOP_N, prefer JOIN category
+                if not is_top_n:
                     category = IntentCategory.JOIN
-                    break
+                break
 
         # Determine entity (table) - find schema table mentioned in text
         entity = self._find_entity(text_lower, schema)
+
+        # Initialize filters list
+        filters = []
 
         # Determine operation
         operation = 'SELECT'
@@ -286,6 +296,39 @@ Return ONLY valid JSON."""
                             entity = search_entity
                             operation = op  # Set the aggregate operation
                             break
+
+        # For TOP_N queries with "based on X" or "by X" (non-aggregate), extract metric from any table
+        # e.g., "top 3 students based on marks" -> metric = mark from grades table
+        # This should run BEFORE the generic _find_metric to prioritize explicit "based on" patterns
+        if not metric and category == IntentCategory.TOP_N:
+            # Look for "based on X" or "by X" pattern
+            based_on_patterns = [
+                r'based\s+on\s+(\w+)',
+                r'\bby\s+(\w+)(?!\s+(?:average|avg|mean|sum|total|count|minimum|min|maximum|max))',  # "by X" but not "by average X"
+            ]
+            for pattern in based_on_patterns:
+                match = re.search(pattern, text_lower)
+                if match:
+                    potential_metric = match.group(1)
+                    # Search ALL tables for this metric
+                    if schema.get('tables'):
+                        for table_name, table_def in schema.get('tables', {}).items():
+                            cols = list(table_def.get('columns', {}).keys())
+                            for col in cols:
+                                # Match both directions for singular/plural: "marks" -> "mark" or "mark" -> "marks"
+                                col_lower = col.lower()
+                                pot_lower = potential_metric.lower()
+                                if (col_lower == pot_lower or
+                                    col_lower.rstrip('s') == pot_lower or
+                                    col_lower == pot_lower.rstrip('s')):
+                                    metric = col
+                                    # If metric is in a different table, we'll need a JOIN
+                                    # Don't change entity here - keep the main entity (students)
+                                    break
+                            if metric:
+                                break
+                    if metric:
+                        break
 
         # For TOP_N queries, also look for "by average X", "by sum X" etc. to extract metric
         if not metric and category == IntentCategory.TOP_N:
@@ -433,6 +476,67 @@ Return ONLY valid JSON."""
         # This should run for ALL cases, not just the else branch
         # If entity is not explicitly mentioned, try to infer from group_by or use first table
         target_entity = entity
+
+        # Also check if metric is in a different table than entity (need JOIN for cross-table metric)
+        metric_table = None
+        if metric and schema.get('tables'):
+            for table_name, table_def in schema.get('tables', {}).items():
+                cols = list(table_def.get('columns', {}).keys())
+                for col in cols:
+                    if col.lower() == metric.lower():
+                        metric_table = table_name
+                        break
+                if metric_table:
+                    break
+
+        # If metric is in a different table, we need a JOIN
+        cross_table_metric = metric_table and entity and metric_table != entity
+
+        # Also extract entity-level filters from natural language (e.g., "from CSE department", "this year")
+        # These should be added to filters
+        if entity and entity in schema.get('tables', {}):
+            entity_cols = list(schema['tables'][entity].get('columns', {}).keys())
+
+            # "from X department" or "in X department" -> department = X
+            dept_pattern = r'(?:from|in)\s+(\w+)\s+department'
+            dept_match = re.search(dept_pattern, text_lower)
+            if dept_match:
+                dept_value = dept_match.group(1)
+                if 'department' in entity_cols:
+                    filters.append({
+                        'column': 'department',
+                        'operator': '=',
+                        'value': dept_value.upper()  # CSE -> CSE
+                    })
+
+            # "this year" -> year = current year (or extract from context)
+            if 'this year' in text_lower:
+                # Look for year column in grades table (if we need to join for it)
+                # But also check if entity has year column
+                if 'year' in entity_cols:
+                    from datetime import datetime
+                    current_year = datetime.now().year
+                    filters.append({
+                        'column': 'year',
+                        'operator': '=',
+                        'value': current_year
+                    })
+
+        # Also check for filters in other tables that we might join with
+        # If we have join_tables and metric is in a joined table, look for filters there
+        if cross_table_metric and metric_table and metric_table in schema.get('tables', {}):
+            metric_table_cols = list(schema['tables'][metric_table].get('columns', {}).keys())
+            # "this year" -> year filter on metric table
+            if 'this year' in text_lower:
+                if 'year' in metric_table_cols:
+                    from datetime import datetime
+                    current_year = datetime.now().year
+                    filters.append({
+                        'column': 'year',
+                        'operator': '=',
+                        'value': current_year
+                    })
+
         if not target_entity and schema.get('tables'):
             # Try to find entity from group_by columns
             for table_name, table_def in schema.get('tables', {}).items():
@@ -481,12 +585,22 @@ Return ONLY valid JSON."""
         # Extract filters (simplified) - pass original text for case-sensitive location matching
         filters = self._extract_filters(intent_text, schema, entity)
 
-        # Detect join tables for JOIN category
+        # Detect join tables for JOIN category or when JOIN pattern detected (e.g., "top N with their Y")
         join_tables = []
         # Also extract explicit columns the user wants to see
         select_columns = []
 
-        if category == IntentCategory.JOIN:
+        # Check if we need join tables: either JOIN category or TOP_N/AGGREGATE with "with their" pattern
+        has_join_pattern = False
+        for pattern in join_patterns:
+            if re.search(pattern, text_lower):
+                has_join_pattern = True
+                break
+
+        if category == IntentCategory.JOIN or (has_join_pattern and category in (IntentCategory.TOP_N, IntentCategory.AGGREGATE)) or cross_table_metric:
+            # If cross_table_metric, add the metric table to join_tables
+            if cross_table_metric and metric_table not in join_tables:
+                join_tables.append(metric_table)
             # Find all tables mentioned in the text that are not the entity
             text_lower = intent_text.lower()
             tables = list(schema.get('tables', {}).keys())
@@ -566,6 +680,37 @@ Return ONLY valid JSON."""
                         if col:
                             select_columns.append(col)
                 break
+
+        # Also extract select_columns from "with their X" pattern when JOIN is detected
+        # e.g., "employees with their department names" -> select employee.name, employee.salary, department.name
+        if has_join_pattern and join_tables:
+            # First add entity's key columns (name-like columns, metric, etc.)
+            if entity and entity in schema.get('tables', {}):
+                entity_cols = list(schema['tables'][entity].get('columns', {}).keys())
+                # Add name-like columns from entity
+                name_cols = [c for c in entity_cols if 'name' in c.lower() or c.lower() in ('title', 'label', 'description', 'first_name', 'last_name')]
+                for nc in name_cols:
+                    select_columns.append(f"{entity}.{nc}")
+                # Add metric if it's a column in entity
+                if metric and metric in entity_cols:
+                    select_columns.append(f"{entity}.{metric}")
+                # If no name columns added, add first few meaningful columns
+                if not name_cols and entity_cols:
+                    for ec in entity_cols[:3]:  # id, name, etc.
+                        select_columns.append(f"{entity}.{ec}")
+
+            # Then add join table columns
+            for join_table in join_tables:
+                if join_table in schema.get('tables', {}):
+                    join_cols = list(schema['tables'][join_table].get('columns', {}).keys())
+                    # Common patterns: "with their names", "with their details"
+                    name_cols = [c for c in join_cols if 'name' in c.lower() or c.lower() in ('title', 'label', 'description')]
+                    if name_cols:
+                        for nc in name_cols:
+                            select_columns.append(f"{join_table}.{nc}")
+                    # If no name-like columns, add the primary key or first column
+                    elif join_cols:
+                        select_columns.append(f"{join_table}.{join_cols[0]}")
 
         intent = StructuredIntent(
             category=category,

@@ -8,6 +8,7 @@ export default function OptimizePage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [dialect, setDialect] = useState('postgresql')
+  const [schemaContext, setSchemaContext] = useState('')
   const [showDiff, setShowDiff] = useState(true)
 
   const handleOptimize = async () => {
@@ -21,7 +22,7 @@ export default function OptimizePage() {
     setResult(null)
 
     try {
-      const data = await api.optimize(sql, dialect)
+      const data = await api.optimize(sql, dialect, schemaContext || undefined)
       setResult(data)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Optimization failed')
@@ -68,6 +69,17 @@ export default function OptimizePage() {
               placeholder="SELECT * FROM employees e JOIN departments d ON e.dept_id = d.id WHERE e.salary > 50000 ORDER BY e.hire_date"
               minHeight="150px"
             />
+          </div>
+          <div className="w-full sm:w-64">
+            <label className="block text-sm font-medium text-gray-700 mb-1">Schema Context (Optional)</label>
+            <textarea
+              value={schemaContext}
+              onChange={(e) => setSchemaContext(e.target.value)}
+              placeholder="e.g., tables: employees(id, name, salary, dept_id), departments(id, name)"
+              className="textarea font-mono text-sm"
+              rows={2}
+            />
+            <p className="text-xs text-gray-500 mt-1">Provide table/column info for better accuracy</p>
           </div>
           <div className="flex flex-col sm:flex-row items-start sm:items-end space-y-2 sm:space-y-0 sm:space-x-4 sm:ml-4 w-full sm:w-auto">
             <div className="w-full sm:w-48">

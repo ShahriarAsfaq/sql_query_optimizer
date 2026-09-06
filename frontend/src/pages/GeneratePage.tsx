@@ -22,7 +22,8 @@ export default function GeneratePage() {
   }>>([])
   const [answers, setAnswers] = useState<Record<string, any>>({})
   const [showClarifyingModal, setShowClarifyingModal] = useState(false)
-  const [partialIntent, setPartialIntent] = useState<any>(null)
+  // Reserved for future use with clarifying questions flow
+  const [_partialIntent, setPartialIntent] = useState<any>(null)
 
   const handleGenerate = async () => {
     if (!naturalLanguage.trim()) {

@@ -2,7 +2,7 @@
 Optimizer Service - generates optimized query candidates and scores them.
 """
 from typing import Dict, Any, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 import logging
 import re
 import copy
@@ -12,6 +12,8 @@ from .validator import ValidationService, ValidationIssue, ValidationSeverity
 from .intent import IntentService, StructuredIntent, IntentCategory
 from ..services.llm_client import LLMClient, MockLLMClient
 from .calcite_client import CalciteClient, CalciteOptimizeResult
+from .plan_analyzer import PlanAnalyzer, PlanAnalysis, PlanNodeMetrics, create_plan_analyzer
+from .semantic_validator import SemanticValidator, SemanticSafety, SemanticCheckResult
 from ml_services.ml_service import get_ml_service
 
 logger = logging.getLogger(__name__)
@@ -27,19 +29,53 @@ class CandidateQuery:
     validation_passed: bool = False
     validation_errors: List[str] = None
 
+    # New fields for performance-driven ranking
+    startup_cost: Optional[float] = None
+    plan_rows: Optional[float] = None
+    plan_width: Optional[int] = None
+    plan_analysis: Optional[PlanAnalysis] = None
+    cost_source: str = "heuristic"
+    semantic_safety: str = "unknown"
+    semantic_details: List[Dict[str, Any]] = field(default_factory=list)
+    optimization_reasons: List[str] = field(default_factory=list)
+    confidence: str = "LOW"
+    performance_score: Optional[float] = None
+    cost_change_percent: Optional[float] = None
+    rewrite_rules_applied: List[str] = field(default_factory=list)
+
     def __post_init__(self):
         if self.validation_errors is None:
             self.validation_errors = []
+        if self.semantic_details is None:
+            self.semantic_details = []
+        if self.optimization_reasons is None:
+            self.optimization_reasons = []
+        if self.rewrite_rules_applied is None:
+            self.rewrite_rules_applied = []
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             'sql': self.sql,
             'description': self.description,
             'cost': self.cost,
+            'startup_cost': self.startup_cost,
+            'plan_rows': self.plan_rows,
+            'plan_width': self.plan_width,
             'complexity_score': self.complexity_score,
             'validation_passed': self.validation_passed,
             'validation_errors': self.validation_errors,
+            'cost_source': self.cost_source,
+            'semantic_safety': self.semantic_safety,
+            'semantic_details': self.semantic_details,
+            'optimization_reasons': self.optimization_reasons,
+            'confidence': self.confidence,
+            'performance_score': self.performance_score,
+            'cost_change_percent': self.cost_change_percent,
+            'rewrite_rules_applied': self.rewrite_rules_applied,
         }
+        if self.plan_analysis:
+            result['plan_analysis'] = self.plan_analysis.to_dict()
+        return result
 
 
 class OptimizerService:
@@ -69,6 +105,12 @@ class OptimizerService:
         # Calcite integration
         self.use_calcite = use_calcite
         self.calcite_client = CalciteClient() if use_calcite else None
+
+        # New: Plan analyzer for EXPLAIN-based performance scoring
+        self.plan_analyzer = create_plan_analyzer()
+
+        # New: Semantic validator for rewrite safety checking
+        self.semantic_validator = SemanticValidator(self.schema)
 
     def optimize(self, sql: str) -> Dict[str, Any]:
         """
@@ -135,10 +177,16 @@ class OptimizerService:
         }
 
     def _optimize_builtin(self, sql: str) -> Dict[str, Any]:
-        """Original built-in optimization logic."""
+        """New performance-driven optimization pipeline with semantic validation.
+
+        Pipeline:
+        Original SQL -> Generate Candidates (with rewrite rules) -> Parse Each
+        -> Schema Validation -> Semantic Validation -> EXPLAIN Each -> Plan Analysis
+        -> Performance Scoring -> Layered Ranking -> Best Candidate
+        """
         # Parse original query
-        parsed = self.parser.parse(sql)
-        if not parsed.is_valid:
+        original_parsed = self.parser.parse(sql)
+        if not original_parsed.is_valid:
             return {
                 'original_sql': sql,
                 'original_cost': None,
@@ -147,30 +195,332 @@ class OptimizerService:
                 'error': 'Original query is invalid'
             }
 
-        # Get original cost
-        original_cost = self._get_explain_cost(sql)
+        # Get original EXPLAIN plan and analyze
+        original_explain = self._get_explain_plan(sql)
+        original_analysis = self.plan_analyzer.analyze(original_explain) if original_explain else None
+        original_cost = original_analysis.total_cost if original_analysis else None
 
-        # Generate candidates
-        candidates = self._generate_candidates(parsed, sql)
+        # Generate candidates with rewrite rule tracking
+        candidates = self._generate_candidates(original_parsed, sql)
 
-        # Validate and score each candidate
+        # Process each candidate through the full pipeline
         scored_candidates = []
         for candidate in candidates:
-            scored = self._score_candidate(candidate, parsed)
-            scored_candidates.append(scored)
+            scored = self._process_candidate_pipeline(candidate, original_parsed, original_analysis, sql)
+            if scored:
+                scored_candidates.append(scored)
 
-        # Rank candidates
-        ranked = self._rank_candidates(scored_candidates, parsed)
+        # Also include original query as a baseline candidate (for comparison)
+        original_candidate = CandidateQuery(
+            sql=sql,
+            description="Original query (baseline)",
+            cost=original_cost,
+            startup_cost=original_analysis.total_startup_cost if original_analysis else None,
+            plan_rows=original_analysis.total_plan_rows if original_analysis else None,
+            plan_analysis=original_analysis,
+            cost_source="postgresql_explain",
+            semantic_safety="safe",
+            semantic_details=[],
+            optimization_reasons=["Baseline query"],
+            confidence="HIGH",
+            performance_score=1.0,  # Baseline = 1.0
+            cost_change_percent=0.0,
+        )
+        # Parse and validate original
+        original_candidate.validation_passed = original_parsed.is_valid
+        original_candidate.validation_errors = [e.message for e in original_parsed.errors] if not original_parsed.is_valid else []
+        original_candidate.complexity_score = self._compute_complexity_score(original_parsed, sql)
+        scored_candidates.insert(0, original_candidate)
 
-        # Get best candidate
+        # Rank candidates using layered ranking
+        ranked = self._rank_candidates_layered(scored_candidates, original_parsed, original_analysis)
+
+        # Get best candidate (excluding original baseline from "best" if it's the only one)
         best = ranked[0] if ranked else None
 
         return {
             'original_sql': sql,
             'original_cost': original_cost,
+            'original_plan_analysis': original_analysis.to_dict() if original_analysis else None,
             'candidates': [c.to_dict() for c in ranked],
             'best_candidate': best.to_dict() if best else None,
         }
+
+    def _process_candidate_pipeline(
+        self,
+        candidate: CandidateQuery,
+        original_parsed: ParsedQuery,
+        original_analysis: Optional[PlanAnalysis],
+        original_sql: str
+    ) -> Optional[CandidateQuery]:
+        """
+        Process a candidate through the full validation and scoring pipeline.
+
+        Steps:
+        1. Parse candidate SQL
+        2. Schema validation (hard constraint - fail fast)
+        3. Semantic validation (hard constraint for UNSAFE rewrites)
+        4. EXPLAIN plan extraction
+        5. Plan analysis
+        6. Performance scoring
+        7. Confidence assessment
+        """
+        # Step 1: Parse candidate
+        candidate_parsed = self.parser.parse(candidate.sql)
+        if not candidate_parsed.is_valid:
+            candidate.validation_passed = False
+            candidate.validation_errors = [e.message for e in candidate_parsed.errors]
+            return candidate
+
+        # Step 2: Schema validation (hard constraint)
+        if self.validator:
+            validation = self.validator.validate(candidate_parsed)
+            candidate.validation_passed = validation['is_valid']
+            candidate.validation_errors = [
+                i['message'] for i in validation['issues']
+                if i['severity'] == 'error'
+            ]
+        else:
+            candidate.validation_passed = candidate_parsed.is_valid
+            candidate.validation_errors = [e.message for e in candidate_parsed.errors] if not candidate_parsed.is_valid else []
+
+        if not candidate.validation_passed:
+            return candidate
+
+        # Step 3: Semantic validation (hard constraint for UNSAFE)
+        rewrite_rules_applied = getattr(candidate, 'rewrite_rules_applied', [])
+        semantic_result = self.semantic_validator.validate_candidate(
+            original_sql, candidate.sql,
+            original_parsed, candidate_parsed,
+            rewrite_rules_applied
+        )
+
+        candidate.semantic_safety = semantic_result['semantic_safety']
+        candidate.semantic_details = semantic_result['safety_details']
+
+        # HARD CONSTRAINT: Reject UNSAFE rewrites
+        if not semantic_result['semantically_valid']:
+            candidate.validation_passed = False
+            candidate.validation_errors.append(f"Semantic validation failed: {semantic_result['semantic_safety']}")
+            return candidate
+
+        # Step 4: EXPLAIN plan extraction
+        candidate_explain = self._get_explain_plan(candidate.sql)
+
+        # Step 5: Plan analysis
+        if candidate_explain:
+            candidate.plan_analysis = self.plan_analyzer.analyze(candidate_explain)
+            candidate.cost = candidate.plan_analysis.total_cost
+            candidate.startup_cost = candidate.plan_analysis.total_startup_cost
+            candidate.plan_rows = candidate.plan_analysis.total_plan_rows
+            candidate.cost_source = "postgresql_explain"
+        else:
+            # Fallback to heuristic cost
+            candidate.cost = self._estimate_cost_from_structure(candidate.sql)
+            candidate.cost_source = "heuristic"
+
+        # Step 6: Performance scoring
+        if original_analysis and candidate.plan_analysis:
+            candidate.performance_score = self._calculate_performance_score(
+                original_analysis, candidate.plan_analysis
+            )
+            candidate.cost_change_percent = self._calculate_cost_change_percent(
+                original_analysis, candidate.plan_analysis
+            )
+        else:
+            candidate.performance_score = None
+            candidate.cost_change_percent = None
+
+        # Step 7: Complexity score (secondary signal)
+        candidate.complexity_score = self._compute_complexity_score(candidate_parsed, candidate.sql)
+
+        # Step 8: Generate optimization reasons
+        candidate.optimization_reasons = self._generate_optimization_reasons(
+            candidate, original_analysis, rewrite_rules_applied
+        )
+
+        # Step 9: Confidence assessment
+        candidate.confidence = self._assess_confidence(
+            candidate, original_analysis, semantic_result
+        )
+
+        return candidate
+
+    def _calculate_performance_score(self, original: PlanAnalysis, candidate: PlanAnalysis) -> float:
+        """Calculate relative performance score (candidate vs original).
+
+        Score > 1.0 means candidate is faster (lower cost).
+        Score < 1.0 means candidate is slower (higher cost).
+        """
+        if original.total_cost <= 0:
+            return 1.0
+
+        # Primary metric: total cost ratio
+        cost_ratio = original.total_cost / candidate.total_cost
+
+        # Adjust for row estimation quality
+        estimation_penalty = 1.0
+        if candidate.estimation_error_nodes > 0:
+            # Penalize plans with high estimation errors (unreliable plans)
+            avg_error = candidate.avg_estimation_error if candidate.estimation_error_nodes > 0 else 1.0
+            # If avg error > 2x or < 0.5x, apply penalty
+            if avg_error > 2.0 or avg_error < 0.5:
+                estimation_penalty = 0.8
+
+        # Adjust for scan efficiency
+        scan_bonus = 1.0
+        total_scans = candidate.seq_scans + candidate.index_scans + candidate.index_only_scans + candidate.bitmap_heap_scans
+        if total_scans > 0:
+            index_ratio = (candidate.index_scans + candidate.index_only_scans + candidate.bitmap_heap_scans) / total_scans
+            if index_ratio > 0.7:  # Mostly index scans
+                scan_bonus = 1.1
+            elif index_ratio < 0.3:  # Mostly seq scans
+                scan_bonus = 0.9
+
+        score = cost_ratio * estimation_penalty * scan_bonus
+
+        # Cap to reasonable range
+        return max(0.1, min(10.0, round(score, 3)))
+
+    def _calculate_cost_change_percent(self, original: PlanAnalysis, candidate: PlanAnalysis) -> float:
+        """Calculate percentage cost change (negative = improvement)."""
+        if original.total_cost <= 0:
+            return 0.0
+        return round(((candidate.total_cost - original.total_cost) / original.total_cost) * 100, 2)
+
+    def _generate_optimization_reasons(
+        self,
+        candidate: CandidateQuery,
+        original_analysis: Optional[PlanAnalysis],
+        rewrite_rules_applied: List[str]
+    ) -> List[str]:
+        """Generate human-readable reasons for the optimization."""
+        reasons = []
+
+        if not original_analysis or not candidate.plan_analysis:
+            reasons.append("Cost estimated heuristically (no EXPLAIN available)")
+            return reasons
+
+        orig = original_analysis
+        cand = candidate.plan_analysis
+
+        # Cost improvement
+        if candidate.cost_change_percent is not None:
+            if candidate.cost_change_percent < -5:
+                reasons.append(f"Estimated cost reduced by {abs(candidate.cost_change_percent):.1f}%")
+            elif candidate.cost_change_percent > 5:
+                reasons.append(f"Estimated cost increased by {candidate.cost_change_percent:.1f}%")
+            else:
+                reasons.append("Estimated cost similar to original")
+
+        # Scan type improvements
+        if cand.seq_scans < orig.seq_scans:
+            reasons.append(f"Reduced sequential scans: {orig.seq_scans} -> {cand.seq_scans}")
+        if cand.index_scans + cand.index_only_scans > orig.index_scans + orig.index_only_scans:
+            reasons.append(f"Increased index scans: {orig.index_scans + orig.index_only_scans} -> {cand.index_scans + cand.index_only_scans}")
+
+        # Join improvements
+        if cand.nested_loops < orig.nested_loops and (cand.hash_joins > orig.hash_joins or cand.merge_joins > orig.merge_joins):
+            reasons.append("Improved join strategy (fewer nested loops, more hash/merge joins)")
+
+        # Sort improvements
+        if cand.sorts < orig.sorts:
+            reasons.append(f"Reduced sort operations: {orig.sorts} -> {cand.sorts}")
+        if cand.incremental_sorts > orig.incremental_sorts:
+            reasons.append("Uses incremental sort (memory efficient)")
+
+        # Subquery/CTE improvements
+        if cand.subplans < orig.subplans:
+            reasons.append(f"Reduced subplans: {orig.subplans} -> {cand.subplans}")
+        if cand.cte_scans > orig.cte_scans:
+            reasons.append("Uses CTE scans (potentially better materialization)")
+
+        # Row estimation quality
+        if cand.estimation_error_nodes < orig.estimation_error_nodes:
+            reasons.append("Improved row estimation accuracy")
+
+        # Rewrite rules applied
+        for rule in rewrite_rules_applied:
+            rule_desc = self._get_rule_description(rule)
+            if rule_desc:
+                reasons.append(f"Applied: {rule_desc}")
+
+        if not reasons:
+            reasons.append("No significant performance difference detected")
+
+        return reasons
+
+    def _get_rule_description(self, rule_name: str) -> Optional[str]:
+        """Get human-readable description of a rewrite rule."""
+        rule_map = {
+            'expand_select_star': 'SELECT * expansion',
+            'add_limit_to_order_by': 'LIMIT added to ORDER BY',
+            'rewrite_non_sargable': 'Non-sargable predicate rewrite (e.g., LOWER() to ILIKE)',
+            'rewrite_correlated_subquery': 'Correlated subquery to JOIN/window function',
+            'add_join_condition': 'Suggested JOIN condition',
+            'rewrite_in_subquery': 'IN subquery to EXISTS/JOIN',
+            'push_down_predicates': 'Predicate pushdown into CTEs',
+            'convert_to_cte': 'Nested subquery to CTE',
+            'reorder_joins': 'JOIN reordering',
+            'predicate_pushdown': 'Predicate pushdown',
+            'remove_distinct': 'DISTINCT removal (proven safe)',
+            'union_to_union_all': 'UNION to UNION ALL (UNSAFE - not applied)',
+            'outer_join_to_inner_join': 'OUTER to INNER JOIN (UNSAFE - not applied)',
+        }
+        return rule_map.get(rule_name)
+
+    def _assess_confidence(
+        self,
+        candidate: CandidateQuery,
+        original_analysis: Optional[PlanAnalysis],
+        semantic_result: Dict[str, Any]
+    ) -> str:
+        """Assess confidence level in the optimization recommendation."""
+        # Base confidence on multiple factors
+        confidence_factors = []
+
+        # Factor 1: EXPLAIN availability
+        if candidate.cost_source == "postgresql_explain":
+            confidence_factors.append("high")
+        else:
+            confidence_factors.append("low")
+
+        # Factor 2: Semantic safety
+        if candidate.semantic_safety == "safe":
+            confidence_factors.append("high")
+        elif candidate.semantic_safety == "conditionally_safe":
+            confidence_factors.append("medium")
+        else:
+            confidence_factors.append("low")
+
+        # Factor 3: Plan analysis quality (if available)
+        if candidate.plan_analysis:
+            if candidate.plan_analysis.estimation_error_nodes == 0:
+                confidence_factors.append("high")
+            elif candidate.plan_analysis.max_estimation_error < 2.0:
+                confidence_factors.append("medium")
+            else:
+                confidence_factors.append("low")
+
+        # Factor 4: Performance improvement magnitude
+        if candidate.performance_score is not None:
+            if candidate.performance_score > 1.2:
+                confidence_factors.append("high")
+            elif candidate.performance_score > 1.0:
+                confidence_factors.append("medium")
+            else:
+                confidence_factors.append("low")
+
+        # Aggregate
+        high_count = confidence_factors.count("high")
+        low_count = confidence_factors.count("low")
+
+        if high_count >= 2 and low_count == 0:
+            return "HIGH"
+        elif low_count >= 2:
+            return "LOW"
+        else:
+            return "MEDIUM"
 
     def generate_from_intent(self, structured_intent: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
@@ -203,91 +553,128 @@ class OptimizerService:
                 description=var_desc
             ))
 
-        # Validate and score
+        # Process each candidate through the new pipeline
         scored = []
         for candidate in candidates:
             parsed = self.parser.parse(candidate.sql)
-            scored.append(self._score_candidate(candidate, parsed))
+            # Use the new pipeline with original_parsed as the first candidate's parsed (baseline)
+            if parsed.is_valid:
+                # Get EXPLAIN for this candidate
+                explain = self._get_explain_plan(candidate.sql)
+                analysis = self.plan_analyzer.analyze(explain) if explain else None
+                candidate.cost = analysis.total_cost if analysis else self._estimate_cost_from_structure(candidate.sql)
+                candidate.startup_cost = analysis.total_startup_cost if analysis else None
+                candidate.plan_rows = analysis.total_plan_rows if analysis else None
+                candidate.plan_analysis = analysis
+                candidate.cost_source = "postgresql_explain" if analysis else "heuristic"
+                candidate.complexity_score = self._compute_complexity_score(parsed, candidate.sql)
+                candidate.validation_passed = True
+                candidate.semantic_safety = "safe"
+                candidate.semantic_details = []
+                candidate.optimization_reasons = ["Intent-based generation"]
+                candidate.confidence = "HIGH" if analysis else "MEDIUM"
+                if analysis:
+                    candidate.performance_score = 1.0  # No baseline for intent-generated
+                    candidate.cost_change_percent = 0.0
+                scored.append(candidate)
 
-        # Rank
-        ranked = self._rank_candidates(scored, None)
+        # Rank using layered ranking (no original baseline for intent-generated)
+        ranked = self._rank_candidates_layered(scored, None, None)
 
         return [c.to_dict() for c in ranked]
 
     def _generate_candidates(self, parsed: ParsedQuery, original_sql: str) -> List[CandidateQuery]:
-        """Generate optimization candidates for a parsed query."""
+        """Generate optimization candidates for a parsed query with rewrite rule tracking.
+
+        Each candidate tracks which rewrite rules were applied for semantic validation.
+        """
         candidates = []
 
-        # 1. Add missing LIMIT if ORDER BY present
-        if parsed.order_by and not parsed.limit:
-            candidate_sql = self._add_limit(original_sql, 100)
-            if candidate_sql != original_sql:
-                candidates.append(CandidateQuery(
-                    sql=candidate_sql,
-                    description="Added LIMIT 100 to ORDER BY query"
-                ))
-
-        # 2. Replace SELECT * with explicit columns
+        # 1. Replace SELECT * with explicit columns (CONDITIONALLY_SAFE)
         if any(c.name == '*' for c in parsed.columns):
             candidate_sql = self._expand_star(original_sql, parsed)
             if candidate_sql != original_sql:
                 candidates.append(CandidateQuery(
                     sql=candidate_sql,
-                    description="Expanded SELECT * to explicit columns"
+                    description="Expanded SELECT * to explicit columns",
+                    rewrite_rules_applied=['expand_select_star']
                 ))
 
-        # 3. Rewrite non-sargable predicates
+        # 2. Rewrite non-sargable predicates (CONDITIONALLY_SAFE)
         candidate_sql = self._rewrite_non_sargable(original_sql, parsed)
         if candidate_sql != original_sql:
             candidates.append(CandidateQuery(
                 sql=candidate_sql,
-                description="Rewrote non-sargable predicates for index usage"
+                description="Rewrote non-sargable predicates for index usage (e.g., LOWER() to ILIKE)",
+                rewrite_rules_applied=['rewrite_non_sargable']
             ))
 
-        # 4. Convert correlated subquery to JOIN/window function
+        # 3. Convert correlated subquery to JOIN/window function (CONDITIONALLY_SAFE)
         if parsed.subqueries:
             candidate_sql = self._rewrite_correlated_subquery(original_sql, parsed)
             if candidate_sql != original_sql:
                 candidates.append(CandidateQuery(
                     sql=candidate_sql,
-                    description="Rewrote correlated subquery as JOIN with window function"
+                    description="Rewrote correlated subquery as JOIN with window function",
+                    rewrite_rules_applied=['rewrite_correlated_subquery']
                 ))
 
-        # 5. Add missing JOIN condition hint
+        # 4. Add missing JOIN condition hint (SAFE - just adds condition)
         for join in parsed.joins:
             if join.type != 'CROSS' and not join.condition:
                 candidate_sql = self._suggest_join_condition(original_sql, join)
                 if candidate_sql != original_sql:
                     candidates.append(CandidateQuery(
                         sql=candidate_sql,
-                        description=f"Added suggested JOIN condition for {join.table.name}"
+                        description=f"Added suggested JOIN condition for {join.table.name}",
+                        rewrite_rules_applied=['add_join_condition']
                     ))
 
-        # 6. Rewrite IN subquery to EXISTS or JOIN
+        # 5. Rewrite IN subquery to EXISTS or JOIN (CONDITIONALLY_SAFE)
         candidate_sql = self._rewrite_in_subquery(original_sql, parsed)
         if candidate_sql != original_sql:
             candidates.append(CandidateQuery(
                 sql=candidate_sql,
-                description="Rewrote IN subquery to EXISTS/JOIN for better performance"
+                description="Rewrote IN subquery to EXISTS/JOIN for better performance",
+                rewrite_rules_applied=['rewrite_in_subquery']
             ))
 
-        # 7. Push down predicates (if CTEs present)
+        # 6. Push down predicates (if CTEs present) (CONDITIONALLY_SAFE)
         if parsed.cte_names:
             candidate_sql = self._push_down_predicates(original_sql, parsed)
             if candidate_sql != original_sql:
                 candidates.append(CandidateQuery(
                     sql=candidate_sql,
-                    description="Pushed predicates into CTEs for early filtering"
+                    description="Pushed predicates into CTEs for early filtering",
+                    rewrite_rules_applied=['push_down_predicates']
                 ))
 
-        # 8. Use CTE instead of nested subquery
+        # 7. Use CTE instead of nested subquery (SAFE)
         if parsed.subqueries and not parsed.cte_names:
             candidate_sql = self._convert_to_cte(original_sql, parsed)
             if candidate_sql != original_sql:
                 candidates.append(CandidateQuery(
                     sql=candidate_sql,
-                    description="Converted nested subquery to CTE for readability"
+                    description="Converted nested subquery to CTE for readability",
+                    rewrite_rules_applied=['convert_to_cte']
                 ))
+
+        # 8. Add LIMIT to ORDER BY (UNSAFE - NOT applied automatically, only suggested)
+        # This is deliberately NOT generated as an automatic candidate
+        # It would change query semantics (fewer rows returned)
+
+        # 9. JOIN reordering (SAFE - PostgreSQL planner handles this)
+        # Not needed as a candidate since planner handles it
+
+        # 10. Predicate pushdown (CONDITIONALLY_SAFE)
+        # Can be applied more broadly than just CTEs
+        candidate_sql = self._push_down_predicates(original_sql, parsed)
+        if candidate_sql != original_sql and not parsed.cte_names:
+            candidates.append(CandidateQuery(
+                sql=candidate_sql,
+                description="Pushed predicates closer to table scans",
+                rewrite_rules_applied=['predicate_pushdown']
+            ))
 
         return candidates
 
@@ -301,18 +688,32 @@ class OptimizerService:
                 new_dir = 'ASC' if ob['direction'] == 'DESC' else 'DESC'
                 var_intent = copy.deepcopy(intent)
                 var_intent.order_by = [{'column': ob['column'], 'direction': new_dir}]
-                var_sql = self._build_query_from_intent(var_intent)
+                var_sql = self._build_query_from_intent(var_intent, self.schema)
                 if var_sql:
                     variations.append((var_sql, f"Same query with {new_dir} order"))
 
         # Variation 2: With/without date filter
         if intent.time_range and intent.filters:
             var_intent = copy.deepcopy(intent)
-            var_intent.filters = [f for f in var_intent.filters
-                                  if f.get('column') != intent.time_range.get('column')]
-            var_sql = self._build_query_from_intent(var_intent)
-            if var_sql:
-                variations.append((var_sql, "Without date filter"))
+            # Handle time_range being either a dict or a string
+            time_range_col = None
+            if isinstance(intent.time_range, dict):
+                time_range_col = intent.time_range.get('column')
+            elif isinstance(intent.time_range, str):
+                # For string time_range like "this year", we need to find the matching filter
+                # Look for a filter that matches the time range column (e.g., "year")
+                for f in intent.filters:
+                    if f.get('column', '').lower() in ('year', 'date', 'created_at', 'updated_at', 'timestamp'):
+                        time_range_col = f.get('column')
+                        break
+            if time_range_col:
+                var_intent.filters = [f for f in var_intent.filters
+                                      if f.get('column') != time_range_col]
+                # Also clear time_range so it doesn't get re-added in _build_query_from_intent
+                var_intent.time_range = None
+                var_sql = self._build_query_from_intent(var_intent, self.schema)
+                if var_sql:
+                    variations.append((var_sql, "Without date filter"))
 
         # Variation 3: Different limit
         if intent.limit:
@@ -320,7 +721,7 @@ class OptimizerService:
                 if alt_limit != intent.limit:
                     var_intent = copy.deepcopy(intent)
                     var_intent.limit = alt_limit
-                    var_sql = self._build_query_from_intent(var_intent)
+                    var_sql = self._build_query_from_intent(var_intent, self.schema)
                     if var_sql:
                         variations.append((var_sql, f"Limit {alt_limit} instead of {intent.limit}"))
 
@@ -379,11 +780,12 @@ class OptimizerService:
 
         if intent.time_range:
             tr = intent.time_range
-            col = tr.get('column', 'created_at')
-            if tr.get('start'):
-                where_conditions.append(f"{col} >= '{tr['start']}'")
-            if tr.get('end'):
-                where_conditions.append(f"{col} <= '{tr['end']}'")
+            if isinstance(tr, dict):
+                col = tr.get('column', 'created_at')
+                if tr.get('start'):
+                    where_conditions.append(f"{col} >= '{tr['start']}'")
+                if tr.get('end'):
+                    where_conditions.append(f"{col} <= '{tr['end']}'")
 
         if where_conditions:
             parts.append(f"WHERE {' AND '.join(where_conditions)}")
@@ -499,32 +901,6 @@ class OptimizerService:
                     mapped.append(user_col)
 
         return mapped
-
-    def _score_candidate(self, candidate: CandidateQuery, original_parsed: Optional[ParsedQuery]) -> CandidateQuery:
-        """Score a candidate query."""
-        # Parse candidate
-        parsed = self.parser.parse(candidate.sql)
-
-        # Validation
-        if self.validator:
-            validation = self.validator.validate(parsed)
-            candidate.validation_passed = validation['is_valid']
-            candidate.validation_errors = [
-                i['message'] for i in validation['issues']
-                if i['severity'] == 'error'
-            ]
-        else:
-            candidate.validation_passed = parsed.is_valid
-            candidate.validation_errors = [e.message for e in parsed.errors] if not parsed.is_valid else []
-
-        # Cost from EXPLAIN
-        if candidate.validation_passed:
-            candidate.cost = self._get_explain_cost(candidate.sql)
-
-        # Complexity score - use ML model if available
-        candidate.complexity_score = self._compute_complexity_score(parsed, candidate.sql)
-
-        return candidate
 
     def _get_explain_cost(self, sql: str) -> Optional[float]:
         """Get estimated cost from PostgreSQL EXPLAIN."""
@@ -692,28 +1068,122 @@ class OptimizerService:
 
         return False
 
-    def _rank_candidates(self, candidates: List[CandidateQuery], original_parsed: Optional[ParsedQuery]) -> List[CandidateQuery]:
-        """Rank candidates by combined score."""
-        def score_fn(c: CandidateQuery) -> Tuple[float, float, float]:
-            # Primary: validation passed (1.0 if passed, 0.0 if not)
-            validity = 1.0 if c.validation_passed else 0.0
+    def _rank_candidates_layered(
+        self,
+        candidates: List[CandidateQuery],
+        original_parsed: Optional[ParsedQuery],
+        original_analysis: Optional[PlanAnalysis]
+    ) -> List[CandidateQuery]:
+        """
+        Layered ranking model for candidate queries.
 
-            # Secondary: cost (lower is better, normalize)
-            cost_score = 0.0
-            if c.cost is not None:
-                # Invert and normalize (assuming max cost ~ 10000)
-                cost_score = max(0.0, 1.0 - (c.cost / 10000.0))
+        Ranking layers (in order of priority):
+        1. HARD CONSTRAINTS: Must pass schema validation AND semantic safety (not UNSAFE)
+        2. PRIMARY PERFORMANCE: Relative cost from EXPLAIN (candidate_cost / baseline_cost)
+        3. SECONDARY SIGNALS: Row estimation quality, scan efficiency, join strategy quality
+        4. STABILITY: Deterministic plans, no volatile functions
+        5. READABILITY (TIE-BREAKER): Complexity score, structural simplicity
+        """
+        def layered_rank_key(c: CandidateQuery) -> Tuple:
+            # LAYER 1: Hard constraints - INVALID or UNSAFE go to bottom
+            if not c.validation_passed:
+                return (5, float('inf'), float('inf'), float('inf'), float('inf'), float('inf'))
+            if c.semantic_safety == "unsafe":
+                return (4, float('inf'), float('inf'), float('inf'), float('inf'), float('inf'))
 
-            # Tertiary: complexity (lower is better)
-            complexity_score = 0.0
+            # LAYER 2: Primary Performance - relative cost ratio
+            # Lower ratio = better (candidate cheaper than baseline)
+            if c.performance_score is not None and c.performance_score > 0:
+                # Invert so higher score = better (sort ascending with negative)
+                perf_rank = -c.performance_score
+            elif c.cost is not None and original_analysis and original_analysis.total_cost > 0:
+                # Fallback: direct cost ratio
+                cost_ratio = c.cost / original_analysis.total_cost
+                perf_rank = cost_ratio  # Lower is better
+            else:
+                perf_rank = float('inf')
+
+            # LAYER 3: Secondary Signals
+            # 3a: Row estimation quality (fewer errors = better)
+            est_error_rank = 0.0
+            if c.plan_analysis:
+                if c.plan_analysis.estimation_error_nodes > 0:
+                    # Average error ratio - closer to 1.0 is better
+                    avg_err = c.plan_analysis.avg_estimation_error
+                    if avg_err > 0:
+                        # Deviation from 1.0
+                        est_error_rank = abs(1.0 - avg_err)
+                    else:
+                        est_error_rank = 1.0
+                else:
+                    est_error_rank = 0.0  # Perfect estimation
+            else:
+                est_error_rank = 1.0  # Unknown
+
+            # 3b: Scan efficiency (index scans vs seq scans)
+            scan_efficiency_rank = 0.0
+            if c.plan_analysis:
+                total_scans = (c.plan_analysis.seq_scans +
+                               c.plan_analysis.index_scans +
+                               c.plan_analysis.index_only_scans +
+                               c.plan_analysis.bitmap_heap_scans)
+                if total_scans > 0:
+                    index_ratio = (c.plan_analysis.index_scans +
+                                   c.plan_analysis.index_only_scans +
+                                   c.plan_analysis.bitmap_heap_scans) / total_scans
+                    # Higher index ratio = better (lower rank)
+                    scan_efficiency_rank = 1.0 - index_ratio
+                else:
+                    scan_efficiency_rank = 0.5
+            else:
+                scan_efficiency_rank = 0.5
+
+            # 3c: Join strategy quality (hash/merge > nested loop)
+            join_quality_rank = 0.0
+            if c.plan_analysis:
+                total_joins = (c.plan_analysis.nested_loops +
+                               c.plan_analysis.hash_joins +
+                               c.plan_analysis.merge_joins)
+                if total_joins > 0:
+                    good_join_ratio = (c.plan_analysis.hash_joins +
+                                       c.plan_analysis.merge_joins) / total_joins
+                    join_quality_rank = 1.0 - good_join_ratio
+                else:
+                    join_quality_rank = 0.0
+            else:
+                join_quality_rank = 0.0
+
+            secondary_rank = (est_error_rank + scan_efficiency_rank + join_quality_rank) / 3.0
+
+            # LAYER 4: Stability
+            # Prefer candidates with EXPLAIN ANALYZE data, deterministic plans
+            stability_rank = 0.0
+            if c.plan_analysis:
+                if c.plan_analysis.explain_analyze:
+                    stability_rank = 0.0  # Best - actual metrics available
+                elif c.cost_source == "postgresql_explain":
+                    stability_rank = 0.2  # Good - planner estimates
+                else:
+                    stability_rank = 0.5  # Heuristic - less reliable
+            else:
+                stability_rank = 1.0  # No plan analysis
+
+            # LAYER 5: Readability / Complexity (tie-breaker)
+            # Lower complexity = better (simpler queries are preferred)
+            complexity_rank = 0.0
             if c.complexity_score is not None:
-                complexity_score = max(0.0, 1.0 - (c.complexity_score / 50.0))
+                complexity_rank = c.complexity_score / 100.0  # Normalize
 
-            # Weighted combination
-            total = (validity * 0.5) + (cost_score * 0.3) + (complexity_score * 0.2)
-            return (-total, c.cost or float('inf'), c.complexity_score or float('inf'))
+            # Return tuple for lexicographic sorting (lower = better)
+            return (
+                0,  # Layer 1: passed hard constraints
+                perf_rank,
+                secondary_rank,
+                stability_rank,
+                complexity_rank,
+            )
 
-        return sorted(candidates, key=score_fn)
+        return sorted(candidates, key=layered_rank_key)
 
     # --- Query rewrite helpers ---
 
@@ -946,8 +1416,20 @@ class OptimizerService:
 
     def _dict_to_intent(self, d: Dict[str, Any]) -> StructuredIntent:
         """Convert dict to StructuredIntent."""
+        # Handle case where category is a list (LLM might return multiple)
+        category = d.get('category', 'RETRIEVE')
+        if isinstance(category, list):
+            # Prefer TOP_N > JOIN > AGGREGATE > others
+            priority = ['TOP_N', 'JOIN', 'AGGREGATE', 'FILTER', 'GROUP', 'SORT', 'TREND', 'RANKING', 'DUPLICATE_DETECTION', 'COMPARISON', 'RETRIEVE', 'UNKNOWN']
+            for cat in priority:
+                if cat in category:
+                    category = cat
+                    break
+            else:
+                category = category[0]  # fallback to first
+
         return StructuredIntent(
-            category=IntentCategory(d.get('category', 'RETRIEVE')),
+            category=IntentCategory(category),
             operation=d.get('operation', 'SELECT'),
             entity=d.get('entity', ''),
             metric=d.get('metric'),

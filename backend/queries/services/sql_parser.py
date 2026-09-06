@@ -540,6 +540,225 @@ class SQLParserService:
             return lines[idx]
         return None
 
+    def _extract_join_columns(self, condition: str) -> List[Tuple[str, str, str, str]]:
+        """
+        Extract column pairs from JOIN condition.
+        Returns list of (left_table, left_col, right_table, right_col).
+        """
+        import re
+        results = []
+        # Pattern: table1.col1 = table2.col2 (or with aliases)
+        pattern = r'(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)'
+        for match in re.finditer(pattern, condition):
+            left_table, left_col, right_table, right_col = match.groups()
+            results.append((left_table, left_col, right_table, right_col))
+        return results
+
+    def build_virtual_schema(self, parsed: ParsedQuery, use_llm: bool = False, llm_client=None) -> Dict[str, Any]:
+        """
+        Build a virtual schema from a parsed SQL query.
+
+        Extracts tables, columns, and join relationships from the query structure.
+
+        Args:
+            parsed: ParsedQuery object from sqlglot parsing
+            use_llm: Whether to use LLM to enhance schema (add types, PK/FK)
+            llm_client: LLMClient instance for enhancement
+
+        Returns:
+            Schema dict with tables, columns, and relationships
+        """
+        tables = {}
+        relationships = []
+
+        # Track all tables and their columns
+        table_columns = {}  # table_name -> set of column names
+        table_aliases = {}  # alias -> table_name
+
+        # First pass: collect tables from FROM/JOIN
+        for table_ref in parsed.tables:
+            table_name = table_ref.name.lower()
+            if table_ref.alias:
+                table_aliases[table_ref.alias.lower()] = table_name
+            if table_name not in table_columns:
+                table_columns[table_name] = set()
+
+        # Second pass: collect columns from SELECT
+        for col in parsed.columns:
+            if col.name == '*' or col.is_alias:
+                continue
+            table_name = (col.table or '').lower()
+            # Resolve alias to table name
+            if table_name in table_aliases:
+                table_name = table_aliases[table_name]
+            if table_name and table_name in table_columns:
+                table_columns[table_name].add(col.name)
+            elif table_name == '' and table_columns:
+                # Ambiguous column - add to all tables
+                for t in table_columns:
+                    table_columns[t].add(col.name)
+
+        # Third pass: collect columns from WHERE conditions
+        for cond in parsed.where_conditions:
+            table_name = (cond.table or '').lower()
+            if table_name in table_aliases:
+                table_name = table_aliases[table_name]
+            if table_name and table_name in table_columns:
+                table_columns[table_name].add(cond.column)
+            elif table_name == '' and table_columns:
+                for t in table_columns:
+                    table_columns[t].add(cond.column)
+
+        # Fourth pass: collect columns from JOIN conditions
+        for join in parsed.joins:
+            if join.condition:
+                join_pairs = self._extract_join_columns(join.condition)
+                for left_table, left_col, right_table, right_col in join_pairs:
+                    left_table = left_table.lower()
+                    right_table = right_table.lower()
+                    # Resolve aliases
+                    if left_table in table_aliases:
+                        left_table = table_aliases[left_table]
+                    if right_table in table_aliases:
+                        right_table = table_aliases[right_table]
+                    if left_table in table_columns:
+                        table_columns[left_table].add(left_col)
+                    if right_table in table_columns:
+                        table_columns[right_table].add(right_col)
+
+                    # Build relationship
+                    relationships.append({
+                        "from_table": left_table,
+                        "from_column": left_col,
+                        "to_table": right_table,
+                        "to_column": right_col,
+                        "type": "one_to_many"  # Default, could be refined
+                    })
+
+        # Also check GROUP BY and ORDER BY for columns
+        for gb in parsed.group_by:
+            # gb is a string like "table.column" or just "column"
+            if '.' in gb:
+                table_name, col_name = gb.split('.', 1)
+                table_name = table_name.lower()
+                if table_name in table_aliases:
+                    table_name = table_aliases[table_name]
+                if table_name in table_columns:
+                    table_columns[table_name].add(col_name)
+            elif table_columns:
+                for t in table_columns:
+                    table_columns[t].add(gb)
+
+        for ob in parsed.order_by:
+            col_expr = ob.get('column', '')
+            if '.' in col_expr:
+                table_name, col_name = col_expr.split('.', 1)
+                table_name = table_name.lower()
+                if table_name in table_aliases:
+                    table_name = table_aliases[table_name]
+                if table_name in table_columns:
+                    table_columns[table_name].add(col_name)
+            elif table_columns:
+                for t in table_columns:
+                    table_columns[t].add(col_expr)
+
+        # Build final tables dict with "unknown" types
+        for table_name, columns in table_columns.items():
+            tables[table_name] = {
+                "columns": {col: "unknown" for col in columns}
+            }
+
+        # If LLM enhancement is requested and client available
+        if use_llm and llm_client and llm_client.is_available():
+            enhanced = self._enhance_schema_with_llm(tables, relationships, llm_client)
+            return enhanced
+
+        return {"tables": tables, "relationships": relationships}
+
+    def _enhance_schema_with_llm(self, tables: Dict, relationships: List, llm_client) -> Dict[str, Any]:
+        """
+        Use LLM to enhance the inferred schema with:
+        - Better data types (int, text, timestamp, numeric, boolean)
+        - Primary key detection
+        - Foreign key relationship refinement
+        """
+        # Build schema summary for LLM
+        schema_summary = ""
+        for table_name, table_def in tables.items():
+            cols = list(table_def.get('columns', {}).keys())
+            schema_summary += f"  {table_name}: {', '.join(cols)}\n"
+
+        rel_summary = ""
+        for rel in relationships:
+            rel_summary += f"  {rel['from_table']}.{rel['from_column']} -> {rel['to_table']}.{rel['to_column']}\n"
+
+        prompt = f"""Given this inferred schema from SQL query analysis, enhance it with proper data types, primary keys, and refined relationships.
+
+Current tables:
+{schema_summary}
+
+Current relationships:
+{rel_summary if rel_summary else "  (none detected)"}
+
+Return ONLY valid JSON with this structure:
+{{
+  "tables": {{
+    "table_name": {{
+      "columns": {{
+        "column_name": "type"  // one of: integer, text, timestamp, numeric, boolean, date, uuid
+      }},
+      "primary_key": ["column_name"]
+    }}
+  }},
+  "relationships": [
+    {{"from_table": "", "from_column": "", "to_table": "", "to_column": "", "type": "one_to_many|many_to_one|one_to_one|self_referential"}}
+  ]
+}}
+
+Guidelines:
+- id, *_id columns -> integer (likely PK/FK)
+- name, email, city, status, category -> text
+- created_at, updated_at, hire_date -> timestamp
+- salary, amount, price, budget, total_amount -> numeric
+- is_active, is_deleted -> boolean
+- Tables usually have 'id' as primary key
+- Relationships: if from_table.column matches to_table.id -> many_to_one from from_table to to_table"""
+
+        try:
+            response = llm_client.complete(prompt, max_tokens=1500, temperature=0.1)
+            import json
+            # Handle markdown code blocks
+            json_str = response
+            if '```json' in response:
+                json_str = response.split('```json')[1].split('```')[0]
+            elif '```' in response:
+                json_str = response.split('```')[1].split('```')[0]
+
+            enhanced = json.loads(json_str.strip())
+
+            # Merge with existing - keep LLM enhancements but don't lose tables
+            if 'tables' in enhanced:
+                for table_name, table_def in enhanced['tables'].items():
+                    if table_name in tables:
+                        # Merge columns - LLM types override "unknown"
+                        existing_cols = tables[table_name]['columns']
+                        for col_name, col_type in table_def.get('columns', {}).items():
+                            existing_cols[col_name] = col_type
+                        if 'primary_key' in table_def:
+                            tables[table_name]['primary_key'] = table_def['primary_key']
+                    else:
+                        tables[table_name] = table_def
+
+            if 'relationships' in enhanced:
+                relationships = enhanced['relationships']
+
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"LLM schema enhancement failed: {e}")
+
+        return {"tables": tables, "relationships": relationships}
+
     def format_for_json(self, parsed: ParsedQuery) -> Dict[str, Any]:
         """Convert ParsedQuery to JSON-serializable dict."""
         return {

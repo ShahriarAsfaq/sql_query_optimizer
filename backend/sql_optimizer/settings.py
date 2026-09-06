@@ -30,7 +30,7 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-ao)&h9hh-!*8ibx_hz=
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DEBUG', 'True').lower() == 'true'
 
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',')
 
 
 # Application definition
@@ -173,3 +173,17 @@ ANTHROPIC_MODEL = os.getenv('ANTHROPIC_MODEL', 'claude-3-5-sonnet-20241022')
 
 # ML Model paths
 ML_MODELS_DIR = BASE_DIR / 'ml_models'
+
+# API Keys for authentication (DEBUG mode allows any key)
+# In production, set API_KEYS environment variable with JSON like:
+# {"your-api-key": {"username": "user", "permissions": ["read", "write"]}}
+API_KEYS = {
+    'dev-key-12345': {
+        'username': 'developer',
+        'permissions': ['read', 'write', 'admin'],
+    },
+    'test-key-67890': {
+        'username': 'tester',
+        'permissions': ['read'],
+    },
+}

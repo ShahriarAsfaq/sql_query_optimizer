@@ -8,6 +8,7 @@ export default function AnalyzePage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [explain, setExplain] = useState(false)
+  const [schemaContext, setSchemaContext] = useState('')
   const [activeTab, setActiveTab] = useState<'ast' | 'tables' | 'joins' | 'explain'>('ast')
 
   const handleAnalyze = async () => {
@@ -21,7 +22,7 @@ export default function AnalyzePage() {
     setResult(null)
 
     try {
-      const data = await api.analyze(sql, explain)
+      const data = await api.analyze(sql, explain, schemaContext || undefined)
       setResult(data)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Analysis failed')
@@ -58,6 +59,17 @@ export default function AnalyzePage() {
               placeholder="SELECT * FROM employees WHERE department = 'Engineering' ORDER BY salary DESC LIMIT 10"
               minHeight="150px"
             />
+          </div>
+          <div className="w-full sm:w-64">
+            <label className="block text-sm font-medium text-gray-700 mb-1">Schema Context (Optional)</label>
+            <textarea
+              value={schemaContext}
+              onChange={(e) => setSchemaContext(e.target.value)}
+              placeholder="e.g., tables: employees(id, name, salary, dept_id), departments(id, name)"
+              className="textarea font-mono text-sm"
+              rows={2}
+            />
+            <p className="text-xs text-gray-500 mt-1">Provide table/column info for better accuracy</p>
           </div>
           <div className="flex items-center space-x-4 sm:ml-4">
             <label className="flex items-center space-x-2 text-sm text-gray-700">
