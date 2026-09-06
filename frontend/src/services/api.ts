@@ -105,7 +105,7 @@ export const api = {
       body: JSON.stringify({ sql, dialect, schema: schemaContext }),
     }),
 
-  // Generate SQL from natural language
+  // Generate SQL from natural language (legacy endpoint)
   generate: (natural_language: string, schema_context?: string, answers?: Record<string, any>) =>
     request<{
       status?: 'success' | 'needs_clarification'
@@ -130,46 +130,25 @@ export const api = {
       body: JSON.stringify({ intent_text: natural_language, schema: schema_context, answers }),
     }),
 
-  // Query history
-  getHistory: (page = 1, pageSize = 20) =>
+  // Generate SQL from natural language (new pipeline endpoint)
+  generateSQL: (query: string, dialect = 'postgresql', schema_context?: string) =>
     request<{
-      results: Array<{
-        id: number
-        query_type: string
-        original_sql: string
-        optimized_sql: string
-        natural_language: string
-        created_at: string
-        execution_time_ms: number
-      }>
-      count: number
-      next: string | null
-      previous: string | null
-    }>(`/queries/history/`, {
-      params: { page: page.toString(), page_size: pageSize.toString() },
-    }),
-
-  getHistoryDetail: (id: number) =>
-    request<{
-      id: number
-      query_type: string
-      original_sql: string
-      optimized_sql: string
-      natural_language: string
+      status: 'success' | 'needs_clarification' | 'failed' | 'error'
+      original_query: string
       intent: any
-      explanation: string
-      created_at: string
-      execution_time_ms: number
-    }>(`/queries/history/${id}/`),
-
-  deleteHistory: (id: number) =>
-    request<void>(`/queries/history/${id}/`, {
-      method: 'DELETE',
-    }),
-
-  clearHistory: () =>
-    request<{ deleted_count: number }>('/queries/history/clear/', {
+      inferred_schema: any
+      sql: string | null
+      assumptions: string[]
+      ambiguities: string[]
+      confidence: number
+      confidence_level: 'HIGH' | 'MEDIUM' | 'LOW'
+      validation: any
+      message: string | null
+      retryable: boolean
+      question: string | null
+    }>('/queries/generate-sql/', {
       method: 'POST',
+      body: JSON.stringify({ query, dialect, schema: schema_context }),
     }),
 }
 

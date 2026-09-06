@@ -134,12 +134,27 @@ class GenerateResponseSerializer(serializers.Serializer):
     warnings = serializers.ListField(child=serializers.CharField(), required=False)
 
 
-class HistoryItemSerializer(serializers.Serializer):
-    id = serializers.IntegerField()
-    sql = serializers.CharField()
-    intent_text = serializers.CharField(allow_null=True, required=False)
-    created_at = serializers.DateTimeField()
-    operation_type = serializers.CharField()
+# New serializers for the pipeline-based generate-sql endpoint
+class GenerateSQLRequestSerializer(serializers.Serializer):
+    query = serializers.CharField()
+    dialect = serializers.ChoiceField(choices=['postgresql', 'mysql', 'sqlite', 'sqlserver'], required=False, default='postgresql')
+    schema = serializers.JSONField(required=False, allow_null=True)
+
+
+class GenerateSQLResponseSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=['success', 'needs_clarification', 'failed', 'error'])
+    original_query = serializers.CharField()
+    intent = serializers.JSONField(required=False, allow_null=True)
+    inferred_schema = serializers.JSONField(required=False, allow_null=True)
+    sql = serializers.CharField(required=False, allow_null=True)
+    assumptions = serializers.ListField(child=serializers.CharField(), required=False)
+    ambiguities = serializers.ListField(child=serializers.CharField(), required=False)
+    confidence = serializers.FloatField(required=False, allow_null=True)
+    confidence_level = serializers.ChoiceField(choices=['HIGH', 'MEDIUM', 'LOW'], required=False, allow_null=True)
+    validation = serializers.JSONField(required=False, allow_null=True)
+    message = serializers.CharField(required=False, allow_null=True)
+    retryable = serializers.BooleanField(required=False, default=False)
+    question = serializers.CharField(required=False, allow_null=True)
 
 
 class SchemaDefinitionSerializer(serializers.Serializer):

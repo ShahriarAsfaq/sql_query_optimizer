@@ -78,6 +78,7 @@ from .serializers import (
     AnalyzeRequestSerializer, AnalyzeResponseSerializer,
     OptimizeRequestSerializer, OptimizeResponseSerializer,
     GenerateRequestSerializer, GenerateResponseSerializer,
+    GenerateSQLRequestSerializer, GenerateSQLResponseSerializer,
     HistoryItemSerializer
 )
 from .services.sql_parser import get_parser, SQLParserService
@@ -87,6 +88,7 @@ from .services.intent import IntentService
 from .services.optimizer import OptimizerService
 from .services.sql_parser import ParsedQuery
 from .services.llm_client import LLMClient
+from .services.gemini_pipeline import create_pipeline, NL2SQLPipeline
 from .models import QueryHistory
 from .authentication import APIKeyAuthentication, QueryHistoryManager
 
@@ -608,41 +610,41 @@ class GenerateQueryView(APIView):
         }
 
 
-class QueryHistoryView(APIView):
+class GenerateSQLView(APIView):
     """
-    GET /api/queries/history/
-    List past query analyses.
+    POST /api/queries/generate-sql/
+    Generate SQL from natural language using the new modular pipeline.
+    Supports schema inference, clarifying questions, and confidence scoring.
     """
     authentication_classes = [APIKeyAuthentication]
     permission_classes = [AllowAny]
 
-    def get(self, request):
-        limit = int(request.query_params.get('limit', 50))
-        offset = int(request.query_params.get('offset', 0))
+    def post(self, request):
+        serializer = GenerateSQLRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        history = QueryHistory.objects.all().order_by('-created_at')[offset:offset + limit]
+        query = serializer.validated_data['query']
+        dialect = serializer.validated_data.get('dialect', 'postgresql')
+        schema = serializer.validated_data.get('schema')
 
-        data = []
-        for entry in history:
-            data.append({
-                'id': entry.id,
-                'sql': entry.sql,
-                'intent_text': entry.intent_text,
-                'created_at': entry.created_at,
-                'operation_type': entry.operation_type,
-            })
+        # Handle schema string format (e.g., "tables: employees(id, name, salary)")
+        if isinstance(schema, str):
+            schema = parse_schema_string(schema)
 
-        serializer = HistoryItemSerializer(data, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        # Create pipeline with LLM client (using Gemini from .env)
+        llm_client = LLMClient(provider='gemini')
+        pipeline = create_pipeline(llm_client=llm_client)
 
-    def delete(self, request):
-        """Delete query history."""
-        history_id = request.query_params.get('id')
-        if history_id:
-            QueryHistory.objects.filter(id=history_id).delete()
-        else:
-            QueryHistory.objects.all().delete()
-        return Response({'message': 'History cleared'}, status=status.HTTP_200_OK)
+        # Process through pipeline
+        result = pipeline.process(query, dialect=dialect, provided_schema=schema)
+
+        # Convert response to serializer format
+        response_data = result.to_dict()
+
+        response_serializer = GenerateSQLResponseSerializer(data=response_data)
+        response_serializer.is_valid(raise_exception=True)
+        return Response(response_serializer.data, status=status.HTTP_200_OK)
 
 
 @api_view(['GET'])

@@ -3,13 +3,11 @@ import { useState } from 'react'
 import AnalyzePage from './pages/AnalyzePage'
 import OptimizePage from './pages/OptimizePage'
 import GeneratePage from './pages/GeneratePage'
-import HistoryPage from './pages/HistoryPage'
 
 const navItems = [
   { path: '/analyze', label: 'Analyze Query' },
   { path: '/optimize', label: 'Optimize Query' },
   { path: '/generate', label: 'Generate SQL' },
-  { path: '/history', label: 'History' },
 ]
 
 function Navbar() {
@@ -96,7 +94,6 @@ function App() {
           <Route path="/analyze" element={<AnalyzePage />} />
           <Route path="/optimize" element={<OptimizePage />} />
           <Route path="/generate" element={<GeneratePage />} />
-          <Route path="/history" element={<HistoryPage />} />
           <Route path="/" element={<Navigate to="/analyze" replace />} />
         </Routes>
       </main>

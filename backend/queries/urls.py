@@ -6,7 +6,7 @@ from .views import (
     AnalyzeQueryView,
     OptimizeQueryView,
     GenerateQueryView,
-    QueryHistoryView,
+    GenerateSQLView,
     health_check,
 )
 
@@ -14,6 +14,6 @@ urlpatterns = [
     path('analyze/', AnalyzeQueryView.as_view(), name='analyze-query'),
     path('optimize/', OptimizeQueryView.as_view(), name='optimize-query'),
     path('generate/', GenerateQueryView.as_view(), name='generate-query'),
-    path('history/', QueryHistoryView.as_view(), name='query-history'),
+    path('generate-sql/', GenerateSQLView.as_view(), name='generate-sql'),
     path('health/', health_check, name='health-check'),
 ]

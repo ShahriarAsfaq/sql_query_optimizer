@@ -41,7 +41,7 @@ export default function GeneratePage() {
     setShowClarifyingModal(false)
 
     try {
-      const data = await api.generate(naturalLanguage, schemaContext || undefined)
+      const data = await api.generateSQL(naturalLanguage, 'postgresql', schemaContext || undefined)
       handleGenerateResponse(data)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Generation failed')
@@ -52,13 +52,30 @@ export default function GeneratePage() {
 
   const handleGenerateResponse = async (data: any) => {
     if (data.status === 'needs_clarification') {
-      // Show clarifying questions
-      setClarifyingQuestions(data.questions || [])
-      setPartialIntent(data.partial_intent)
+      // Show clarifying questions - convert from new pipeline format
+      const questions = data.ambiguities?.map((amb: string, idx: number) => ({
+        field: `clarification_${idx}`,
+        type: 'text' as const,
+        question: amb,
+        options: [],
+        current_value: '',
+        optional: false,
+      })) || []
+      setClarifyingQuestions(questions)
+      setPartialIntent(data.intent)
       setShowClarifyingModal(true)
+    } else if (data.status === 'success') {
+      // Success - convert to legacy format for existing UI
+      setResult({
+        sql: data.sql,
+        intent: data.intent,
+        explanation: data.assumptions?.join('. ') || data.message || 'Generated SQL',
+        confidence: data.confidence,
+        warnings: data.validation?.issues || [],
+      })
     } else {
-      // Success
-      setResult(data)
+      // Failed or error
+      setError(data.message || 'Generation failed')
     }
   }
 
@@ -80,7 +97,9 @@ export default function GeneratePage() {
     setError(null)
 
     try {
-      const data = await api.generate(naturalLanguage, schemaContext || undefined, answers)
+      // For clarification, we need to send the clarified query with answers
+      // For now, re-run with the original query (the pipeline doesn't support iterative clarification yet)
+      const data = await api.generateSQL(naturalLanguage, 'postgresql', schemaContext || undefined)
       handleGenerateResponse(data)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Generation failed')
@@ -307,8 +326,13 @@ export default function GeneratePage() {
                 <div className="card p-4">
                   <p className="text-sm text-gray-500">Intent Category</p>
                   <div className="flex flex-wrap gap-2 mt-1">
-                    {result.intent?.category ? (
-                      <span key={0} className={intentCategoryColors[result.intent.category] || 'badge bg-gray-100 text-gray-600'}>
+                    {/* Handle new pipeline intent format */}
+                    {result.intent?.operation ? (
+                      <span key="op" className={intentCategoryColors[result.intent.operation] || 'badge bg-gray-100 text-gray-600'}>
+                        {result.intent.operation.replace('_', ' ')}
+                      </span>
+                    ) : result.intent?.category ? (
+                      <span key="cat" className={intentCategoryColors[result.intent.category] || 'badge bg-gray-100 text-gray-600'}>
                         {result.intent.category.replace('_', ' ')}
                       </span>
                     ) : (
@@ -318,12 +342,25 @@ export default function GeneratePage() {
                         </span>
                       ))
                     )}
+                    {/* Show confidence level badge */}
+                    {result.confidence_level && (
+                      <span key="conf" className={`badge ${
+                        result.confidence_level === 'HIGH' ? 'badge-success' :
+                        result.confidence_level === 'MEDIUM' ? 'badge-warning' : 'badge-error'
+                      }`}>
+                        {result.confidence_level}
+                      </span>
+                    )}
                   </div>
                 </div>
                 <div className="card p-4">
                   <p className="text-sm text-gray-500">Target Tables</p>
                   <p className="text-lg font-medium text-gray-900 mt-1">
-                    {result.intent?.entity
+                    {result.inferred_schema?.tables && result.inferred_schema.tables.length > 0
+                      ? result.inferred_schema.tables.map((t: any) => t.name).join(', ')
+                      : result.intent?.entities?.length > 0
+                      ? result.intent.entities.join(', ')
+                      : result.intent?.entity
                       ? result.intent.entity
                       : result.intent?.target_tables?.length > 0
                       ? result.intent.target_tables.join(', ')
@@ -354,8 +391,29 @@ export default function GeneratePage() {
                   </svg>
                   <span>Explanation</span>
                 </h3>
-                <p className="text-sm text-blue-700 whitespace-pre-wrap">{result.explanation || 'No explanation available'}</p>
+                <p className="text-sm text-blue-700 whitespace-pre-wrap">
+                  {result.assumptions?.length > 0
+                    ? result.assumptions.join('. ')
+                    : result.explanation || 'No explanation available'}
+                </p>
               </div>
+
+              {/* Inferred Schema */}
+              {result.inferred_schema?.tables && result.inferred_schema.tables.length > 0 && (
+                <details className="group">
+                  <summary className="cursor-pointer flex items-center space-x-2 text-sm font-medium text-gray-700 hover:text-gray-900">
+                    <svg className="w-5 h-5 text-gray-400 group-open:rotate-90 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" />
+                    </svg>
+                    <span>Inferred Schema</span>
+                  </summary>
+                  <div className="mt-4 p-4 bg-gray-50 rounded-lg">
+                    <pre className="text-sm text-gray-700 overflow-x-auto">
+                      <code>{JSON.stringify(result.inferred_schema, null, 2)}</code>
+                    </pre>
+                  </div>
+                </details>
+              )}
 
               {/* Intent Details */}
               <details className="group">
@@ -372,17 +430,34 @@ export default function GeneratePage() {
                 </div>
               </details>
 
-              {/* Warnings */}
-              {result.warnings && result.warnings.length > 0 && (
+              {/* Ambiguities */}
+              {result.ambiguities && result.ambiguities.length > 0 && (
                 <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
-                  <h3 className="text-sm font-medium text-yellow-800 mb-2">Warnings</h3>
+                  <h3 className="text-sm font-medium text-yellow-800 mb-2">Ambiguities</h3>
                   <ul className="space-y-1 text-sm text-yellow-700">
-                    {result.warnings.map((warning: string, i: number) => (
+                    {result.ambiguities.map((ambiguity: string, i: number) => (
                       <li key={i} className="flex items-start space-x-2">
                         <svg className="w-4 h-4 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
                           <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
                         </svg>
-                        <span>{warning}</span>
+                        <span>{ambiguity}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Validation Issues */}
+              {result.validation?.issues && result.validation.issues.length > 0 && (
+                <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+                  <h3 className="text-sm font-medium text-red-800 mb-2">Validation Issues</h3>
+                  <ul className="space-y-1 text-sm text-red-700">
+                    {result.validation.issues.map((issue: string, i: number) => (
+                      <li key={i} className="flex items-start space-x-2">
+                        <svg className="w-4 h-4 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                          <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                        </svg>
+                        <span>{issue}</span>
                       </li>
                     ))}
                   </ul>
@@ -399,6 +474,7 @@ export default function GeneratePage() {
                     'Average salary by department',
                     'Employees hired after 2020 with their managers',
                     'Count of employees per department',
+                    'Show top 3 students based on marks from CSE department',
                   ].map((example, i) => (
                     <button
                       key={i}
