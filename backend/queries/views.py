@@ -79,7 +79,6 @@ from .serializers import (
     OptimizeRequestSerializer, OptimizeResponseSerializer,
     GenerateRequestSerializer, GenerateResponseSerializer,
     GenerateSQLRequestSerializer, GenerateSQLResponseSerializer,
-    HistoryItemSerializer
 )
 from .services.sql_parser import get_parser, SQLParserService
 from .services.validator import ValidationService
@@ -89,8 +88,7 @@ from .services.optimizer import OptimizerService
 from .services.sql_parser import ParsedQuery
 from .services.llm_client import LLMClient
 from .services.gemini_pipeline import create_pipeline, NL2SQLPipeline
-from .models import QueryHistory
-from .authentication import APIKeyAuthentication, QueryHistoryManager
+from .authentication import APIKeyAuthentication
 
 
 class AnalyzeQueryView(APIView):

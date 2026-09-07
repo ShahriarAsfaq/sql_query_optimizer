@@ -190,6 +190,8 @@ class SchemaInferrer:
         'sales': ['id', 'product', 'amount', 'date', 'region'],
         'department': ['id', 'name', 'budget', 'manager_id'],
         'departments': ['id', 'name', 'budget', 'manager_id'],
+        'grade': ['id', 'student_id', 'subject', 'marks', 'year'],
+        'grades': ['id', 'student_id', 'subject', 'marks', 'year'],
     }
 
     @classmethod
@@ -390,22 +392,29 @@ class IntentExtractor:
     def __init__(self, llm_client: LLMClient):
         self.llm_client = llm_client
 
-    def extract(self, query: str) -> IntentResult:
+    def extract(self, query: str, schema: Optional[InferredSchema] = None) -> IntentResult:
         """Extract intent from natural language query."""
-        prompt = self._build_prompt(query)
+        prompt = self._build_prompt(query, schema)
 
         try:
             response = self.llm_client.complete(prompt, max_tokens=1500, temperature=0.1)
             return self._parse_response(response, query)
         except Exception as e:
             logger.error(f"LLM intent extraction failed: {e}")
-            return self._fallback_extract(query)
+            return self._fallback_extract(query, schema)
 
-    def _build_prompt(self, query: str) -> str:
+    def _build_prompt(self, query: str, schema: Optional[InferredSchema] = None) -> str:
         """Build the prompt for intent extraction."""
+        schema_str = ""
+        if schema and schema.tables:
+            schema_str = "\nProvided schema:\n" + "\n".join(f"  {t['name']}({', '.join(t.get('columns', []))})" for t in schema.tables)
+            if schema.relationships:
+                schema_str += "\nRelationships:\n" + "\n".join(f"  {r['from_table']}.{r['from_column']} -> {r['to_table']}.{r['to_column']}" for r in schema.relationships)
+
         return f"""You are an expert at extracting structured intent from natural language database queries.
 
 Extract intent from this user request: "{query}"
+{schema_str}
 
 Return ONLY valid JSON with these exact fields:
 {{
@@ -432,10 +441,13 @@ Rules:
 7. grouping: GROUP BY columns.
 8. joins: JOIN clauses if multiple entities relate.
 9. ambiguities: List any unclear parts (e.g., "best" without metric, missing table names).
+10. When schema is provided, use ONLY tables and columns from the schema.
+11. If requested fields/filters are in different tables, include appropriate joins in the "joins" field.
 
 Examples:
 
 Query: "show top 3 students based on marks from CSE department"
+Schema: students(id, name, department), grades(id, student_id, subject, marks, year)
 {{
   "operation": "SELECT",
   "entities": ["student"],
@@ -445,7 +457,7 @@ Query: "show top 3 students based on marks from CSE department"
   "limit": 3,
   "aggregations": [],
   "grouping": [],
-  "joins": [],
+  "joins": [{{"table": "grades", "on": "students.id = grades.student_id", "type": "INNER"}}],
   "ambiguities": ["Exact student table name unknown", "Exact marks column name unknown"]
 }}
 
@@ -521,8 +533,8 @@ Return JSON only:"""
             raw_text=original_query
         )
 
-    def _fallback_extract(self, query: str) -> IntentResult:
-        """Rule-based fallback extraction."""
+    def _fallback_extract(self, query: str, schema: Optional[InferredSchema] = None) -> IntentResult:
+        """Rule-based fallback extraction with schema awareness."""
         text_lower = query.lower()
 
         # Simple keyword-based extraction
@@ -543,6 +555,7 @@ Return JSON only:"""
             'order': ['order', 'orders', 'purchase', 'purchases'],
             'sale': ['sale', 'sales', 'revenue'],
             'department': ['department', 'departments', 'dept'],
+            'grade': ['grade', 'grades', 'mark', 'marks'],
         }
 
         for entity, keywords in entity_keywords.items():
@@ -557,7 +570,6 @@ Return JSON only:"""
         limit_match = re.search(r'(?:top|first)\s+(\d+)', text_lower)
         if limit_match:
             intent.limit = int(limit_match.group(1))
-            intent.ambiguities.append("Metric for 'top' not specified")
 
         # Detect aggregations
         if 'average' in text_lower or 'avg' in text_lower:
@@ -569,6 +581,193 @@ Return JSON only:"""
         elif 'count' in text_lower:
             intent.operation = 'COUNT'
             intent.aggregations.append({"function": "COUNT", "field": "*"})
+
+        # Schema-aware extraction
+        if schema and schema.tables:
+            # Collect all known columns from schema
+            all_columns = {}
+            for table in schema.tables:
+                table_name = table['name']
+                for col in table.get('columns', []):
+                    if col not in all_columns:
+                        all_columns[col] = []
+                    all_columns[col].append(table_name)
+
+            # Detect requested fields (nouns that match column names)
+            # Look for patterns like "show X", "get X", "find X", "list X"
+            field_patterns = [
+                r'(?:show|get|find|list|display|select)\s+(?:me\s+)?(?:the\s+)?([a-zA-Z_][a-zA-Z0-9_]*(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*)*)',
+                r'(?:based\s+on|by|order\s+by|sort\s+by)\s+([a-zA-Z_][a-zA-Z0-9_]*)',
+            ]
+            for pattern in field_patterns:
+                matches = re.findall(pattern, text_lower)
+                for match in matches:
+                    fields = [f.strip() for f in match.split(',')]
+                    for field in fields:
+                        if field in all_columns and field not in intent.requested_fields:
+                            intent.requested_fields.append(field)
+
+            # Common field mappings
+            field_aliases = {
+                'mark': 'marks',
+                'marks': 'marks',
+                'score': 'marks',
+                'salary': 'salary',
+                'pay': 'salary',
+                'name': 'name',
+                'id': 'id',
+                'dept': 'department',
+                'department': 'department',
+                'year': 'year',
+                'subject': 'subject',
+                'highest': 'salary',  # For "highest paid" -> salary
+                'paid': 'salary',
+                'earning': 'salary',
+            }
+            for alias, canonical in field_aliases.items():
+                if alias in text_lower and canonical not in intent.requested_fields:
+                    intent.requested_fields.append(canonical)
+
+            # For TOP_N queries with "highest paid" or similar, add the ordering field to requested fields
+            if intent.limit and intent.ordering:
+                order_field = intent.ordering.get('field')
+                if order_field and order_field not in intent.requested_fields:
+                    intent.requested_fields.append(order_field)
+
+            # Detect filters from schema-aware patterns
+            # "from CSE department" -> department = 'CSE'
+            dept_match = re.search(r'(?:from|in)\s+([A-Z]{2,})\s*(?:dept|department)?', query)
+            if dept_match:
+                dept_value = dept_match.group(1)
+                if 'department' in all_columns:
+                    intent.filters.append({"field": "department", "operator": "=", "value": dept_value})
+
+            # "this year" -> year = current year
+            if 'this year' in text_lower:
+                import datetime
+                current_year = datetime.datetime.now().year
+                if 'year' in all_columns:
+                    intent.filters.append({"field": "year", "operator": "=", "value": current_year})
+
+            # Numeric comparisons: "greater than X", "less than X", "more than X", "at least X", etc.
+            comparison_patterns = [
+                (r'(?:greater\s+than|more\s+than|above|over)\s+(\d+(?:\.\d+)?)', '>'),
+                (r'(?:less\s+than|below|under)\s+(\d+(?:\.\d+)?)', '<'),
+                (r'(?:at\s+least|minimum|min)\s+(\d+(?:\.\d+)?)', '>='),
+                (r'(?:at\s+most|maximum|max)\s+(\d+(?:\.\d+)?)', '<='),
+                (r'equal\s+to\s+(\d+(?:\.\d+)?)', '='),
+            ]
+            for pattern, operator in comparison_patterns:
+                match = re.search(pattern, text_lower)
+                if match:
+                    value = float(match.group(1)) if '.' in match.group(1) else int(match.group(1))
+                    # Try to find the column being compared from context
+                    # Look at words before the comparison
+                    before_text = text_lower[:match.start()].strip().split()[-3:]
+                    for word in reversed(before_text):
+                        if word in all_columns:
+                            intent.filters.append({"field": word, "operator": operator, "value": value})
+                            break
+
+            # Detect ordering from "based on X" or "by X" (but not "by X" when it follows aggregation words)
+            # Look for "order by", "sort by", "based on" - but "by" alone after aggregation is grouping
+            order_match = re.search(r'(?:based\s+on|order\s+by|sort\s+by)\s+([a-zA-Z_][a-zA-Z0-9_]*)', text_lower)
+            if order_match:
+                order_field = order_match.group(1)
+                if order_field in all_columns:
+                    direction = 'DESC' if intent.limit else 'ASC'
+                    intent.ordering = {"field": order_field, "direction": direction}
+            else:
+                # Check for "by X" but NOT when it follows aggregation words (count/total/sum/average/avg/per)
+                by_match = re.search(r'\bby\s+([a-zA-Z_][a-zA-Z0-9_]*)', text_lower)
+                # Check if "by" is preceded by aggregation words (meaning it's grouping, not ordering)
+                if by_match:
+                    before_by = text_lower[:by_match.start()].strip()
+                    # If "by" follows aggregation words, it's grouping, not ordering
+                    agg_words = ['count', 'total', 'sum', 'average', 'avg', 'per', 'for each']
+                    is_grouping = any(before_by.endswith(w) for w in agg_words)
+                    if not is_grouping:
+                        order_field = by_match.group(1)
+                        if order_field in all_columns:
+                            direction = 'DESC' if intent.limit else 'ASC'
+                            intent.ordering = {"field": order_field, "direction": direction}
+
+            if not intent.ordering:
+                # Check for "highest X" or "lowest X" patterns for TOP_N queries
+                if intent.limit:
+                    highest_match = re.search(r'highest\s+([a-zA-Z_][a-zA-Z0-9_]*)', text_lower)
+                    lowest_match = re.search(r'lowest\s+([a-zA-Z_][a-zA-Z0-9_]*)', text_lower)
+                    if highest_match:
+                        order_field = highest_match.group(1)
+                        if order_field in field_aliases:
+                            order_field = field_aliases[order_field]
+                        if order_field in all_columns:
+                            intent.ordering = {"field": order_field, "direction": "DESC"}
+                    elif lowest_match:
+                        order_field = lowest_match.group(1)
+                        if order_field in field_aliases:
+                            order_field = field_aliases[order_field]
+                        if order_field in all_columns:
+                            intent.ordering = {"field": order_field, "direction": "ASC"}
+
+            # Detect grouping: "per X", "for each X", "by X" (after aggregation), "group by X"
+            grouping_patterns = [
+                r'per\s+([a-zA-Z_][a-zA-Z0-9_]*)',
+                r'for\s+each\s+([a-zA-Z_][a-zA-Z0-9_]*)',
+                r'by\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:count|total|sum|average|avg)',
+                r'group\s+by\s+([a-zA-Z_][a-zA-Z0-9_]*)',
+            ]
+            for pattern in grouping_patterns:
+                gm = re.search(pattern, text_lower)
+                if gm:
+                    group_field = gm.group(1)
+                    # Resolve aliases
+                    if group_field in field_aliases:
+                        group_field = field_aliases[group_field]
+                    if group_field in all_columns and group_field not in intent.grouping:
+                        intent.grouping.append(group_field)
+                        # Grouping field is usually also a requested field
+                        if group_field not in intent.requested_fields:
+                            intent.requested_fields.append(group_field)
+
+            # Detect joins: if requested fields and filters come from different tables
+            if schema.relationships and len(schema.tables) > 1:
+                requested_tables = set()
+                for field in intent.requested_fields:
+                    requested_tables.update(all_columns.get(field, []))
+                filter_tables = set()
+                for f in intent.filters:
+                    filter_tables.update(all_columns.get(f.get('field', ''), []))
+                order_tables = set()
+                if intent.ordering:
+                    order_tables.update(all_columns.get(intent.ordering.get('field', ''), []))
+
+                all_mentioned_tables = requested_tables | filter_tables | order_tables
+                if len(all_mentioned_tables) > 1:
+                    # Add joins based on relationships
+                    for rel in schema.relationships:
+                        from_t = rel.get('from_table')
+                        to_t = rel.get('to_table')
+                        if from_t in all_mentioned_tables and to_t in all_mentioned_tables:
+                            # Map relationship type to SQL join type
+                            rel_type = rel.get('type', '').lower()
+                            if rel_type in ('one_to_many', 'many_to_one', 'one_to_one'):
+                                join_type = 'INNER'
+                            elif rel_type == 'left':
+                                join_type = 'LEFT'
+                            elif rel_type == 'right':
+                                join_type = 'RIGHT'
+                            else:
+                                join_type = 'INNER'
+                            intent.joins.append({
+                                "table": to_t,
+                                "on": f"{from_t}.{rel.get('from_column')} = {to_t}.{rel.get('to_column')}",
+                                "type": join_type
+                            })
+
+            # Clean up ambiguities - if we found ordering field, remove the ambiguity
+            if intent.ordering:
+                intent.ambiguities = [a for a in intent.ambiguities if 'top' not in a.lower() and 'metric' not in a.lower()]
 
         return intent
 
@@ -680,18 +879,82 @@ Return JSON with:
         main_table = schema.tables[0]['name']
         columns = schema.tables[0].get('columns', [])
 
-        # Build SELECT
+        # Build SELECT - handle aggregations
         select_fields = []
         if intent.requested_fields:
             for field in intent.requested_fields:
                 select_fields.append(field)
-        else:
+
+        # Add aggregations to SELECT
+        for agg in intent.aggregations:
+            func = agg.get('function', 'COUNT')
+            field = agg.get('field', '*')
+            alias = agg.get('alias')
+            if alias:
+                select_fields.append(f"{func}({field}) AS {alias}")
+            else:
+                select_fields.append(f"{func}({field})")
+
+        # If no fields at all and no aggregations, use *
+        if not select_fields:
             select_fields = ['*']
 
         select_clause = f"SELECT {', '.join(select_fields)}"
 
-        # Build FROM
+        # Build FROM with JOINs - use intent.joins if available, otherwise infer from schema
         from_clause = f"FROM {main_table}"
+
+        # Get all tables referenced in the query (from fields, filters, ordering)
+        all_mentioned_tables = set([main_table])
+        table_columns = {}  # table -> set of columns
+        for table in schema.tables:
+            table_columns[table['name']] = set(table.get('columns', []))
+
+        # Check which tables have the requested fields
+        for field in intent.requested_fields:
+            for table_name, cols in table_columns.items():
+                if field in cols:
+                    all_mentioned_tables.add(table_name)
+
+        for f in intent.filters:
+            field = f.get('field', '')
+            for table_name, cols in table_columns.items():
+                if field in cols:
+                    all_mentioned_tables.add(table_name)
+
+        if intent.ordering:
+            field = intent.ordering.get('field', '')
+            for table_name, cols in table_columns.items():
+                if field in cols:
+                    all_mentioned_tables.add(table_name)
+
+        # Build JOINs based on schema relationships
+        if len(all_mentioned_tables) > 1 and schema.relationships:
+            for rel in schema.relationships:
+                from_t = rel.get('from_table')
+                to_t = rel.get('to_table')
+                if from_t in all_mentioned_tables and to_t in all_mentioned_tables:
+                    # Map relationship type to SQL join type
+                    rel_type = rel.get('type', '').lower()
+                    if rel_type in ('one_to_many', 'many_to_one', 'one_to_one'):
+                        join_type = 'INNER'
+                    elif rel_type == 'left':
+                        join_type = 'LEFT'
+                    elif rel_type == 'right':
+                        join_type = 'RIGHT'
+                    else:
+                        join_type = 'INNER'
+                    join_on = f"{from_t}.{rel.get('from_column')} = {to_t}.{rel.get('to_column')}"
+                    from_clause += f" {join_type} JOIN {to_t} ON {join_on}"
+
+        # Also use explicit intent.joins if provided (they take precedence)
+        elif intent.joins:
+            for join in intent.joins:
+                join_table = join.get('table', '')
+                join_on = join.get('on', '')
+                join_type = join.get('type', 'INNER')
+                if join_table and join_on:
+                    from_clause += f" {join_type} JOIN {join_table} ON {join_on}"
 
         # Build WHERE
         where_conditions = []
@@ -725,8 +988,11 @@ Return JSON with:
         group_clause = ""
         if intent.grouping:
             group_clause = f"GROUP BY {', '.join(intent.grouping)}"
+        elif intent.aggregations and intent.requested_fields:
+            # If we have aggregations but no explicit GROUP BY, group by requested non-aggregate fields
+            group_clause = f"GROUP BY {', '.join(intent.requested_fields)}"
 
-        # Combine
+        # Combine - correct SQL order: SELECT, FROM, WHERE, GROUP BY, ORDER BY, LIMIT
         sql_parts = [select_clause, from_clause]
         if where_clause:
             sql_parts.append(where_clause)
@@ -739,13 +1005,22 @@ Return JSON with:
 
         sql = ' '.join(sql_parts) + ';'
 
+        assumptions = [
+            f"Table name assumed to be {main_table}",
+            f"Columns assumed: {', '.join(columns[:5])}{'...' if len(columns) > 5 else ''}"
+        ]
+        if intent.joins:
+            assumptions.append(f"JOINs added based on intent: {', '.join(j.get('table', '') for j in intent.joins)}")
+        elif schema.relationships and len(all_mentioned_tables) > 1:
+            joined = [j.get('to_table', '') for rel in schema.relationships
+                     for j in [rel] if rel.get('from_table') in all_mentioned_tables and rel.get('to_table') in all_mentioned_tables]
+            if joined:
+                assumptions.append(f"JOINs inferred from schema relationships: {', '.join(joined)}")
+
         return SQLGenerationResult(
             sql=sql,
             explanation=f"Generated query for {intent.operation} operation on {main_table}",
-            assumptions=[
-                f"Table name assumed to be {main_table}",
-                f"Columns assumed: {', '.join(columns[:5])}{'...' if len(columns) > 5 else ''}"
-            ],
+            assumptions=assumptions,
             ambiguities=intent.ambiguities,
             confidence=0.6
         )
@@ -1073,17 +1348,21 @@ class NL2SQLPipeline:
 
         normalized_query = self.input_validator.normalize(query)
 
-        # Step 2: Intent Extraction
-        if self.intent_extractor:
-            intent = self.intent_extractor.extract(normalized_query)
-        else:
-            intent = self._fallback_extract(normalized_query)
-
-        # Step 3: Schema Inference (or use provided schema)
+        # Step 2: Schema Inference (or use provided schema) - do this BEFORE intent extraction
+        # so that intent extractor can use schema to detect cross-table references
         if provided_schema:
             inferred_schema = self._convert_provided_schema(provided_schema)
         else:
-            inferred_schema = self.schema_inferrer.infer(normalized_query, intent)
+            # Do a preliminary intent extraction to get entities for schema inference
+            # Use rule-based extraction since we don't have LLM context yet
+            preliminary_intent = self._preliminary_intent_extract(normalized_query)
+            inferred_schema = self.schema_inferrer.infer(normalized_query, preliminary_intent)
+
+        # Step 3: Intent Extraction (now with schema context)
+        if self.intent_extractor:
+            intent = self.intent_extractor.extract(normalized_query, inferred_schema)
+        else:
+            intent = self._fallback_extract(normalized_query)
 
         # Step 4: Ambiguity Detection
         ambiguities = self.ambiguity_detector.detect(normalized_query, intent)
@@ -1162,7 +1441,60 @@ class NL2SQLPipeline:
             if 'best' in amb.lower() or 'worst' in amb.lower():
                 if not intent.limit and not intent.ordering:
                     return True
+
+        # Also clarify if TOP_N without ordering metric
+        for amb in ambiguities:
+            if 'top_n' in amb.lower() or 'ordering metric' in amb.lower():
+                return True
+
         return False
+
+    def _preliminary_intent_extract(self, query: str) -> IntentResult:
+        """Extract basic intent (entities, etc.) for schema inference before full LLM extraction."""
+        text_lower = query.lower()
+
+        intent = IntentResult(
+            operation='SELECT',
+            entities=[],
+            requested_fields=[],
+            filters=[],
+            raw_text=query
+        )
+
+        # Detect entities from keywords
+        entity_keywords = {
+            'student': ['student', 'students'],
+            'employee': ['employee', 'employees', 'staff', 'worker'],
+            'product': ['product', 'products', 'item', 'items'],
+            'customer': ['customer', 'customers', 'client', 'clients'],
+            'order': ['order', 'orders', 'purchase', 'purchases'],
+            'sale': ['sale', 'sales', 'revenue'],
+            'department': ['department', 'departments', 'dept'],
+            'grade': ['grade', 'grades', 'mark', 'marks'],
+        }
+
+        for entity, keywords in entity_keywords.items():
+            if any(kw in text_lower for kw in keywords):
+                intent.entities.append(entity)
+
+        # Default entity if none found
+        if not intent.entities:
+            intent.entities = ['record']
+
+        # Detect TOP_N
+        limit_match = re.search(r'(?:top|first)\s+(\d+)', text_lower)
+        if limit_match:
+            intent.limit = int(limit_match.group(1))
+
+        # Detect aggregations
+        if 'average' in text_lower or 'avg' in text_lower:
+            intent.operation = 'AVG'
+        elif 'sum' in text_lower or 'total' in text_lower:
+            intent.operation = 'SUM'
+        elif 'count' in text_lower:
+            intent.operation = 'COUNT'
+
+        return intent
 
     def _fallback_extract(self, query: str) -> IntentResult:
         """Fallback rule-based extraction when LLM unavailable."""
@@ -1178,17 +1510,37 @@ class NL2SQLPipeline:
     def _convert_provided_schema(self, schema: Dict[str, Any]) -> InferredSchema:
         """Convert provided schema dict to InferredSchema."""
         tables = []
-        for table_name, table_def in schema.get('tables', {}).items():
-            if isinstance(table_def, dict) and 'columns' in table_def:
-                cols = list(table_def['columns'].keys()) if isinstance(table_def['columns'], dict) else table_def['columns']
-            else:
-                cols = table_def if isinstance(table_def, list) else []
-            tables.append({
-                'name': table_name,
-                'columns': cols
-            })
+        relationships = []
 
-        relationships = schema.get('relationships', [])
+        # Handle different schema formats
+        tables_dict = schema.get('tables', {})
+        if isinstance(tables_dict, list):
+            # If tables is a list of table objects
+            for table in tables_dict:
+                if isinstance(table, dict) and 'name' in table:
+                    tables.append({
+                        'name': table['name'],
+                        'columns': table.get('columns', [])
+                    })
+        elif isinstance(tables_dict, dict):
+            # If tables is a dict mapping table_name -> table_def
+            for table_name, table_def in tables_dict.items():
+                # Skip 'relationships' key if it's inside tables (malformed input)
+                if table_name == 'relationships':
+                    relationships = table_def if isinstance(table_def, list) else []
+                    continue
+                if isinstance(table_def, dict) and 'columns' in table_def:
+                    cols = list(table_def['columns'].keys()) if isinstance(table_def['columns'], dict) else table_def['columns']
+                else:
+                    cols = table_def if isinstance(table_def, list) else []
+                tables.append({
+                    'name': table_name,
+                    'columns': cols
+                })
+
+        # Also check for relationships at top level
+        if not relationships:
+            relationships = schema.get('relationships', [])
 
         return InferredSchema(
             tables=tables,
