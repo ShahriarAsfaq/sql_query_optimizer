@@ -319,6 +319,145 @@ def test_rewrite_filter_before_join():
     print("[OK] Filter pushdown works")
 
 
+# --- NEW: qualify_columns + CURRENT_YEAR tests ---------------------------------
+
+SCHEMA_ALIAS = {
+    'tables': {
+        'student': {
+            'columns': {
+                'id': {'type': 'integer', 'primary_key': True},
+                'name': {'type': 'text'},
+                'department': {'type': 'text'},
+            },
+            'primary_key': ['id'],
+            'indexes': [],
+        },
+        'grades': {
+            'columns': {
+                'id': {'type': 'integer', 'primary_key': True},
+                'student_id': {'type': 'integer'},
+                'mark': {'type': 'numeric'},
+                'year': {'type': 'integer'},
+            },
+            'primary_key': ['id'],
+            'indexes': [],
+        },
+    },
+    'relationships': [
+        {'from_table': 'grades', 'from_column': 'student_id', 'to_table': 'student', 'to_column': 'id', 'type': 'many_to_one'},
+    ],
+}
+engine_alias = RewriteEngine(SCHEMA_ALIAS)
+
+
+def test_rewrite_qualify_columns_top_n():
+    """Exact user query: aliases + qualification + CURRENT_YEAR resolution."""
+    sql = "SELECT name, mark FROM student INNER JOIN grades ON student.id = grades.student_id WHERE department = 'CSE' AND year = 'CURRENT_YEAR' ORDER BY mark DESC LIMIT 3"
+    parsed = parser.parse(sql)
+    structure = analyze_query_structure(parsed, sql, SCHEMA_ALIAS)
+
+    result = engine_alias.rewrite_qualify_columns(sql, parsed, structure)
+    expected = "SELECT s.name, g.mark FROM student s INNER JOIN grades g ON student.id = grades.student_id WHERE s.department = 'CSE' AND g.year = '2026' ORDER BY g.mark DESC LIMIT 3"
+    print(f"qualify_columns top-N: {result}")
+    assert result == expected, f"Expected:\n{expected}\nGot:\n{result}"
+    print("[OK] qualify_columns exact match")
+
+
+def test_rewrite_qualify_columns_existing_aliases():
+    """Input already aliased (student st, grades g) -> aliases reused, cols qualified."""
+    sql = "SELECT name, mark FROM student st INNER JOIN grades g ON st.id = g.student_id WHERE department = 'CSE' AND year = 'CURRENT_YEAR' ORDER BY mark DESC LIMIT 3"
+    parsed = parser.parse(sql)
+    structure = analyze_query_structure(parsed, sql, SCHEMA_ALIAS)
+
+    result = engine_alias.rewrite_qualify_columns(sql, parsed, structure)
+    print(f"qualify_columns existing aliases: {result}")
+    # Existing aliases preserved; unqualified columns get those aliases
+    assert "st.name" in result and "g.mark" in result
+    assert "st.department" in result and "g.year" in result
+    assert "2026" in result
+    # No duplicate aliasing: 'student st' appears once, not 'student st st'
+    # The table name 'student' appears in 'student st' and in the JOIN condition
+    assert "student st" in result
+    assert "grades g" in result
+    # Verify the ON clause still references the correct table names
+    assert "st.id = g.student_id" in result or "g.student_id = st.id" in result
+    print("[OK] Existing aliases reused")
+
+
+def test_rewrite_qualify_columns_ambiguous_skip():
+    """Column present in both tables stays unqualified (ambiguous) -> no candidate (conservative: no change)."""
+    schema_amb = {
+        'tables': {
+            't1': {'columns': {'id': {'type': 'integer', 'primary_key': True}, 'val': {'type': 'text'}}, 'primary_key': ['id']},
+            't2': {'columns': {'id': {'type': 'integer', 'primary_key': True}, 'val': {'type': 'text'}}, 'primary_key': ['id']},
+        },
+        'relationships': [],
+    }
+    engine_amb = RewriteEngine(schema_amb)
+    sql = "SELECT val FROM t1 INNER JOIN t2 ON t1.id = t2.id"
+    parsed = parser.parse(sql)
+    structure = analyze_query_structure(parsed, sql, schema_amb)
+
+    result = engine_amb.rewrite_qualify_columns(sql, parsed, structure)
+    print(f"qualify_columns ambiguous: {result}")
+    # 'val' is ambiguous (exists in both) -> stays unqualified
+    # No CURRENT_YEAR, no columns qualified -> returns None (no candidate produced)
+    assert result is None, "Ambiguous column + no placeholder -> no candidate"
+    print("[OK] Ambiguous column returns None (no change)")
+
+
+def test_rewrite_qualify_columns_subquery_bail():
+    """FROM (SELECT ...) -> returns None (conservative)."""
+    sql = "SELECT name FROM (SELECT name FROM student) s"
+    parsed = parser.parse(sql)
+    structure = analyze_query_structure(parsed, sql, SCHEMA_ALIAS)
+
+    result = engine_alias.rewrite_qualify_columns(sql, parsed, structure)
+    print(f"qualify_columns subquery: {result}")
+    assert result is None, "Subquery in FROM should bail"
+    print("[OK] Subquery in FROM bails")
+
+
+def test_rewrite_current_year_placeholder_single_table():
+    """One table, WHERE year = 'CURRENT_YEAR' -> year = '2026' (placeholder resolution without aliasing)."""
+    schema_single = {
+        'tables': {
+            'students': {'columns': {'id': {'type': 'integer', 'primary_key': True}, 'year': {'type': 'integer'}}, 'primary_key': ['id']},
+        },
+        'relationships': [],
+    }
+    engine_single = RewriteEngine(schema_single)
+    sql = "SELECT * FROM students WHERE year = 'CURRENT_YEAR'"
+    parsed = parser.parse(sql)
+    structure = analyze_query_structure(parsed, sql, schema_single)
+
+    result = engine_single.rewrite_qualify_columns(sql, parsed, structure)
+    print(f"CURRENT_YEAR single table: {result}")
+    assert result is not None
+    assert "2026" in result
+    assert "CURRENT_YEAR" not in result
+    print("[OK] CURRENT_YEAR resolved without multi-table")
+
+
+def test_rewrite_qualify_columns_no_op():
+    """Fully-qualified single-table query, no placeholder -> None."""
+    schema_single = {
+        'tables': {
+            'students': {'columns': {'id': {'type': 'integer', 'primary_key': True}, 'name': {'type': 'text'}}, 'primary_key': ['id']},
+        },
+        'relationships': [],
+    }
+    engine_single = RewriteEngine(schema_single)
+    sql = "SELECT students.name FROM students WHERE students.id = 1"
+    parsed = parser.parse(sql)
+    structure = analyze_query_structure(parsed, sql, schema_single)
+
+    result = engine_single.rewrite_qualify_columns(sql, parsed, structure)
+    print(f"qualify_columns no-op: {result}")
+    assert result is None, "Already qualified, no placeholder -> no candidate"
+    print("[OK] No-op when nothing to do")
+
+
 if __name__ == '__main__':
     print("=" * 60)
     print("Testing Rewrite Engine Correctness")
@@ -342,6 +481,14 @@ if __name__ == '__main__':
     test_rewrite_cross_join_fk()
     test_rewrite_cross_join_no_fk()
     test_rewrite_filter_before_join()
+
+    # NEW: qualify_columns tests
+    test_rewrite_qualify_columns_top_n()
+    test_rewrite_qualify_columns_existing_aliases()
+    test_rewrite_qualify_columns_ambiguous_skip()
+    test_rewrite_qualify_columns_subquery_bail()
+    test_rewrite_current_year_placeholder_single_table()
+    test_rewrite_qualify_columns_no_op()
 
     print("\n" + "=" * 60)
     print("All rewrite correctness tests PASSED!")

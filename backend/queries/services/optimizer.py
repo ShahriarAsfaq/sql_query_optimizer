@@ -478,7 +478,7 @@ class OptimizerService:
             'sql_optimizations': self._extract_sql_optimizations(enriched_candidates),
             'index_recommendations': index_advice_to_dicts(index_recommendations + redundant_indexes),
             'statistics_recommendations': [r.to_dict() for r in stats_recommendations],
-            'warnings': self._generate_warnings(enriched_candidates, all_opportunities),
+            'warnings': warnings,
             'opportunities': opportunity_list_to_dicts(all_opportunities),
             'evidence_source': 'EXPLAIN_ANALYZE' if run_analyze and original_analysis and original_analysis.total_execution_time > 0 else 'EXPLAIN',
             'heuristic_used': original_analysis is None,

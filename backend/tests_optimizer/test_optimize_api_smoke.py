@@ -256,6 +256,62 @@ def test_default_explain_without_analyze():
     print("[OK] Default EXPLAIN without ANALYZE")
 
 
+# --- NEW: qualify_columns candidate generation + promotion -------------------
+
+SCHEMA_ALIAS_API = {
+    'tables': {
+        'student': {
+            'columns': {
+                'id': {'type': 'integer', 'primary_key': True},
+                'name': {'type': 'text'},
+                'department': {'type': 'text'},
+            },
+            'primary_key': ['id'],
+            'indexes': [],
+        },
+        'grades': {
+            'columns': {
+                'id': {'type': 'integer', 'primary_key': True},
+                'student_id': {'type': 'integer'},
+                'mark': {'type': 'numeric'},
+                'year': {'type': 'integer'},
+            },
+            'primary_key': ['id'],
+            'indexes': [],
+        },
+    },
+    'relationships': [
+        {'from_table': 'grades', 'from_column': 'student_id', 'to_table': 'student', 'to_column': 'id', 'type': 'many_to_one'},
+    ],
+}
+
+
+def test_qualify_columns_candidate_generated():
+    """qualify_columns candidate is generated + promoted as best (no DB needed)."""
+    optimizer = OptimizerService(SCHEMA_ALIAS_API, use_calcite=False)
+
+    sql = "SELECT name, mark FROM student INNER JOIN grades ON student.id = grades.student_id WHERE department = 'CSE' AND year = 'CURRENT_YEAR' ORDER BY mark DESC LIMIT 3"
+    result = optimizer.optimize(sql)
+
+    # Check candidate with qualify_columns rule exists
+    qualify_candidates = [c for c in result['candidates'] if 'qualify_columns' in (c.get('rewrite_rules_applied') or [])]
+    assert qualify_candidates, f"No qualify_columns candidate; got {result['candidates']}"
+    qc = qualify_candidates[0]
+    assert qc['validation_passed'] is True, f"Candidate failed validation: {qc}"
+
+    # Check best candidate is the promoted qualified version
+    expected = "SELECT s.name, g.mark FROM student s INNER JOIN grades g ON student.id = grades.student_id WHERE s.department = 'CSE' AND g.year = '2026' ORDER BY g.mark DESC LIMIT 3"
+    assert result['best_candidate']['sql'] == expected, f"Expected:\n{expected}\nGot:\n{result['best_candidate']['sql']}"
+
+    # Check resolution warning present
+    warnings = result['warnings']
+    assert any('CURRENT_YEAR' in w for w in warnings), f"No CURRENT_YEAR warning in {warnings}"
+
+    print(f"Best candidate: {result['best_candidate']['sql']}")
+    print(f"Warnings: {warnings}")
+    print("[OK] qualify_columns candidate generated and promoted")
+
+
 if __name__ == '__main__':
     print("=" * 60)
     print("Testing Optimize API Smoke")
@@ -268,6 +324,9 @@ if __name__ == '__main__':
     test_drf_view_path()
     test_drf_enable_actual_execution_flag()
     test_default_explain_without_analyze()
+
+    # NEW: qualify_columns test
+    test_qualify_columns_candidate_generated()
 
     print("\n" + "=" * 60)
     print("All optimize API smoke tests PASSED!")

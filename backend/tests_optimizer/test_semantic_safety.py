@@ -240,6 +240,60 @@ def test_distinct_on_not_removable():
     print("[OK] DISTINCT ON correctly advisory")
 
 
+# --- NEW: qualify_columns semantic safety test --------------------------------
+
+SCHEMA_ALIAS_SAFETY = {
+    'tables': {
+        'student': {
+            'columns': {
+                'id': {'type': 'integer', 'primary_key': True},
+                'name': {'type': 'text'},
+                'department': {'type': 'text'},
+            },
+            'primary_key': ['id'],
+            'indexes': [],
+        },
+        'grades': {
+            'columns': {
+                'id': {'type': 'integer', 'primary_key': True},
+                'student_id': {'type': 'integer'},
+                'mark': {'type': 'numeric'},
+                'year': {'type': 'integer'},
+            },
+            'primary_key': ['id'],
+            'indexes': [],
+        },
+    },
+    'relationships': [
+        {'from_table': 'grades', 'from_column': 'student_id', 'to_table': 'student', 'to_column': 'id', 'type': 'many_to_one'},
+    ],
+}
+
+
+def test_qualify_columns_conditionally_safe():
+    """qualify_columns is CONDITIONALLY_SAFE (not UNSAFE) despite ORDER BY alias change."""
+    from queries.services.semantic_validator import SemanticValidator, SemanticSafety
+
+    validator = SemanticValidator(SCHEMA_ALIAS_SAFETY)
+
+    original_sql = "SELECT name, mark FROM student INNER JOIN grades ON student.id = grades.student_id WHERE department = 'CSE' AND year = 'CURRENT_YEAR' ORDER BY mark DESC LIMIT 3"
+    rewritten_sql = "SELECT s.name, g.mark FROM student s INNER JOIN grades g ON student.id = grades.student_id WHERE s.department = 'CSE' AND g.year = '2026' ORDER BY g.mark DESC LIMIT 3"
+
+    original_parsed = parser.parse(original_sql)
+    rewritten_parsed = parser.parse(rewritten_sql)
+
+    result = validator.validate_candidate(
+        original_sql, rewritten_sql,
+        original_parsed, rewritten_parsed,
+        ['qualify_columns']
+    )
+    print(f"qualify_columns safety: {result['semantic_safety']}")
+    assert result['semantically_valid'] is True
+    assert result['semantic_safety'] == SemanticSafety.CONDITIONALLY_SAFE.value, \
+        f"Expected CONDITIONALLY_SAFE, got {result['semantic_safety']}"
+    print("[OK] qualify_columns is CONDITIONALLY_SAFE (not UNSAFE)")
+
+
 if __name__ == '__main__':
     print("=" * 60)
     print("Testing Semantic Safety")
@@ -259,6 +313,9 @@ if __name__ == '__main__':
     test_day_boundary_month_end()
     test_leading_wildcard_never_rewritten()
     test_distinct_on_not_removable()
+
+    # NEW: qualify_columns semantic safety
+    test_qualify_columns_conditionally_safe()
 
     print("\n" + "=" * 60)
     print("All semantic safety tests PASSED!")

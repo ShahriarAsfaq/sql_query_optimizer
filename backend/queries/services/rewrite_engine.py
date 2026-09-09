@@ -776,7 +776,7 @@ class RewriteEngine:
             return None
 
         tables_in_scope = []
-        from_node = ast.args.get('from')
+        from_node = ast.args.get('from_')
         if from_node is not None:
             if not isinstance(from_node.this, exp.Table):
                 return None
