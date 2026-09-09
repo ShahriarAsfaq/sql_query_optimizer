@@ -83,6 +83,8 @@ class OptimizeRequestSerializer(serializers.Serializer):
     sql = serializers.CharField()
     schema = serializers.JSONField(required=False, allow_null=True)
     use_calcite = serializers.BooleanField(required=False, default=True)
+    enable_actual_execution = serializers.BooleanField(required=False, default=False)
+    optimization_thresholds = serializers.JSONField(required=False, allow_null=True)
 
 
 class CandidateQuerySerializer(serializers.Serializer):
@@ -104,6 +106,23 @@ class CandidateQuerySerializer(serializers.Serializer):
     cost_change_percent = serializers.FloatField(allow_null=True)
     rewrite_rules_applied = serializers.ListField(child=serializers.CharField(), required=False)
     plan_analysis = serializers.DictField(allow_null=True, required=False)
+    # New additive fields (backward compatible)
+    semantic_risk = serializers.CharField(allow_null=True, required=False)
+    plan_metrics = serializers.DictField(allow_null=True, required=False)
+    optimization_opportunities = serializers.ListField(child=serializers.DictField(), required=False)
+    index_recommendations = serializers.ListField(child=serializers.DictField(), required=False)
+    statistics_recommendations = serializers.ListField(child=serializers.DictField(), required=False)
+    evidence_quality = serializers.CharField(allow_null=True, required=False)
+    actual_execution_time = serializers.FloatField(allow_null=True, required=False)
+    planning_time = serializers.FloatField(allow_null=True, required=False)
+    execution_time = serializers.FloatField(allow_null=True, required=False)
+    row_estimation_quality = serializers.CharField(allow_null=True, required=False)
+    performance_improvement = serializers.CharField(allow_null=True, required=False)
+    evidence_source = serializers.CharField(allow_null=True, required=False)
+    confidence_level = serializers.CharField(allow_null=True, required=False)
+    confidence_score = serializers.FloatField(allow_null=True, required=False)
+    # Thinking engine: WHY this candidate beats the baseline (additive).
+    improvement_evidence = serializers.DictField(allow_null=True, required=False)
 
 
 class OptimizeResponseSerializer(serializers.Serializer):
@@ -112,6 +131,20 @@ class OptimizeResponseSerializer(serializers.Serializer):
     original_plan_analysis = serializers.DictField(allow_null=True, required=False)
     candidates = CandidateQuerySerializer(many=True)
     best_candidate = CandidateQuerySerializer(allow_null=True)
+    # New additive top-level fields (backward compatible)
+    sql_optimizations = serializers.ListField(child=serializers.DictField(), required=False)
+    index_recommendations = serializers.ListField(child=serializers.DictField(), required=False)
+    statistics_recommendations = serializers.ListField(child=serializers.DictField(), required=False)
+    warnings = serializers.ListField(child=serializers.CharField(), required=False)
+    opportunities = serializers.ListField(child=serializers.DictField(), required=False)
+    evidence_source = serializers.CharField(allow_null=True, required=False)
+    heuristic_used = serializers.BooleanField(required=False, default=False)
+    # --- Thinking engine (additive) ---
+    query_intent = serializers.DictField(required=False)
+    cost_flow = serializers.DictField(required=False)
+    reasoning = serializers.DictField(required=False)
+    optimization_strategy = serializers.DictField(allow_null=True, required=False)
+    plan_comparison = serializers.DictField(allow_null=True, required=False)
 
 
 class GenerateRequestSerializer(serializers.Serializer):

@@ -16,60 +16,153 @@ logger = logging.getLogger(__name__)
 import re
 
 
-def parse_schema_string(schema_str: str) -> Dict[str, Any]:
+def _parse_column_spec(spec: str):
+    """Parse a column spec like ``'id:integer primary_key'`` into (name, col_def).
+
+    *col_def* is a bare string (the type) when no flags are present, or a dict
+    with ``'type'`` and optional ``'primary_key'``, ``'not_null'``, ``'unique'``
+    boolean flags.  Returns ``(None, None)`` on empty/blank input.
     """
-    Parse schema string format into dict format.
+    spec = spec.strip()
+    if not spec:
+        return None, None
 
-    Input formats supported:
-    - "tables: employees(id, name, salary), departments(id, name)"
-    - "table: users(id, email, password)"
-    - "employees(id, name, salary), departments(id, name)"
-    - "employees(id, name, salary)"
-    - "tables: customers(id, name), orders(id, customer_id); relationships: customers.id -> orders.customer_id"
-
-    Output: {"tables": {"employees": {"columns": {"id": "integer", "name": "text", "salary": "numeric"}}, ...}, "relationships": [...]}
-    """
-    result = {"tables": {}, "relationships": []}
-
-    # Try to extract tables part with "tables:" or "table:" prefix
-    tables_match = re.search(r'tables?:\s*(.+?)(?:\s*;|$)', schema_str, re.IGNORECASE)
-    if tables_match:
-        tables_part = tables_match.group(1)
+    if ':' in spec:
+        name, rest = spec.split(':', 1)
+        name = name.strip()
+        rest = rest.strip()
+        parts = rest.split()
+        col_type = parts[0] if parts else 'text'
+        flags = {p.lower().replace(' ', '_') for p in parts[1:]}
     else:
-        # Assume the whole string is the tables part
-        tables_part = schema_str
+        name = spec
+        col_type = 'text'
+        flags = set()
 
-    # Parse each table: table_name(col1, col2, ...)
+    if not name:
+        return None, None
+
+    has_flags = bool(flags & {'primary_key', 'not_null', 'unique'})
+    if has_flags:
+        col_def: Dict[str, Any] = {'type': col_type}
+        if 'primary_key' in flags:
+            col_def['primary_key'] = True
+        if 'not_null' in flags:
+            col_def['not_null'] = True
+        if 'unique' in flags:
+            col_def['unique'] = True
+        return name, col_def
+
+    return name, col_type
+
+
+def parse_schema_string(schema_str: str) -> Dict[str, Any]:
+    """Parse a schema string into the canonical dict format.
+
+    Supported column spec::
+
+        table(col:type [flags], ...)
+        # flags: primary_key, not_null, unique
+
+    Supported top-level indexes (outside table parens)::
+
+        indexes: employees(salary unique), departments(name)
+
+    Supported relationships (outside table parens, optional type suffix)::
+
+        employees.department_id -> departments.id many_to_one
+
+    Backward-compatible with bare column lists (all columns become ``"text"``)::
+
+        employees(id, name, salary)
+    """
+    result: Dict[str, Any] = {"tables": {}, "relationships": []}
+
     table_pattern = r'(\w+)\s*\(([^)]+)\)'
-    for match in re.finditer(table_pattern, tables_part):
-        table_name = match.group(1)
-        cols_str = match.group(2)
-        columns = {}
-        for col in cols_str.split(','):
-            col = col.strip()
-            if col:
-                # Default to text type if no type specified
-                columns[col] = "text"
-        result["tables"][table_name] = {"columns": columns}
 
-    # Try to extract relationships part
-    rel_match = re.search(r'relationships?:\s*(.+)$', schema_str, re.IGNORECASE)
-    if rel_match:
-        rel_part = rel_match.group(1)
-        # Parse relationships: from_table.from_col -> to_table.to_col
-        rel_pattern = r'(\w+)\.(\w+)\s*(?:->|->>)\s*(\w+)\.(\w+)'
-        for match in re.finditer(rel_pattern, rel_part):
-            from_table = match.group(1)
-            from_col = match.group(2)
-            to_table = match.group(3)
-            to_col = match.group(4)
-            result["relationships"].append({
-                "from_table": from_table,
-                "from_column": from_col,
-                "to_table": to_table,
-                "to_column": to_col,
-                "type": "one_to_many"
-            })
+    # --- Top-level indexes (after "indexes:" keyword) ---
+    idx_map: Dict[str, list] = {}  # table_name -> [(cols, unique)]
+    idx_span = None  # (start, end) of the indexes section, excluded from tables
+    idx_match = re.search(r'\bindexes?:\s*(.+?)(?:\s*[;|]|$)', schema_str, re.IGNORECASE)
+    if idx_match:
+        idx_text = idx_match.group(1)
+        idx_span = (idx_match.start(), idx_match.end())
+        for im in re.finditer(r'(\w+)\s*\(([^)]+)\)', idx_text):
+            tbl = im.group(1).lower()
+            inner = im.group(2)
+            # 'unique' may appear inside the parens (after a column) or after it.
+            after = idx_text[im.end():].split(',')[0]
+            is_unique = bool(re.search(r'\bunique\b', inner + ' ' + after, re.IGNORECASE))
+            cols = []
+            for token in inner.split(','):
+                token = token.strip()
+                if not token:
+                    continue
+                token = re.sub(r'\bunique\b', '', token, flags=re.IGNORECASE).strip()
+                if token:
+                    cols.append(token.lower())
+            idx_map.setdefault(tbl, []).append((cols, is_unique))
+
+    # --- Table definitions (exclude matches inside the indexes section) ---
+    table_matches = []
+    for tm in re.finditer(table_pattern, schema_str):
+        if idx_span and tm.start() < idx_span[1] and tm.end() > idx_span[0]:
+            continue  # this is an index definition, not a table
+        table_matches.append(tm)
+
+    # Record character positions inside table parentheses so we can skip
+    # relationship patterns that appear inside them (e.g. in malformed input).
+    paren_positions: set = set()
+    for tm in table_matches:
+        for i in range(tm.start(), tm.end()):
+            paren_positions.add(i)
+
+    # --- Relationships (-> patterns outside table parens) ---
+    rel_re = r'(\w+)\.(\w+)\s*(?:->|->>)\s*(\w+)\.(\w+)(?:\s+(\w+))?'
+    for m in re.finditer(rel_re, schema_str):
+        if m.start() in paren_positions:
+            continue
+        result["relationships"].append({
+            "from_table": m.group(1).lower(),
+            "from_column": m.group(2).lower(),
+            "to_table": m.group(3).lower(),
+            "to_column": m.group(4).lower(),
+            "type": m.group(5) if m.group(5) else "one_to_many",
+        })
+
+    # --- Parse each table definition ---
+    for tm in table_matches:
+        table_name = tm.group(1).lower()
+        cols_str = tm.group(2)
+        columns: Dict[str, Any] = {}
+        pk_cols: List[str] = []
+
+        for spec in cols_str.split(','):
+            name, col_def = _parse_column_spec(spec)
+            if name is None:
+                continue
+            columns[name] = col_def
+            if isinstance(col_def, dict) and col_def.get('primary_key'):
+                pk_cols.append(name)
+
+        table_def: Dict[str, Any] = {"columns": columns}
+        if pk_cols:
+            table_def["primary_key"] = pk_cols
+
+        if table_name in idx_map:
+            table_def["indexes"] = [
+                {"columns": c, "unique": u} for c, u in idx_map[table_name]
+            ]
+
+        result["tables"][table_name] = table_def
+
+    # Attach indexes for tables not already present (index-only reference).
+    for tbl, entries in idx_map.items():
+        if tbl not in result["tables"]:
+            result["tables"][tbl] = {
+                "columns": {},
+                "indexes": [{"columns": c, "unique": u} for c, u in entries],
+            }
 
     return result
 
@@ -189,6 +282,7 @@ class OptimizeQueryView(APIView):
         sql = serializer.validated_data['sql']
         schema = serializer.validated_data.get('schema')
         use_calcite = serializer.validated_data.get('use_calcite', True)
+        enable_actual_execution = serializer.validated_data.get('enable_actual_execution', False)
 
         # Handle schema: string format -> dict, or infer virtual schema if not provided
         if isinstance(schema, str):
@@ -201,8 +295,9 @@ class OptimizeQueryView(APIView):
 
         # Get seed database connection for EXPLAIN
         seed_db = connections['seed_db']
-        optimizer = OptimizerService(schema, seed_db_connection=seed_db, use_calcite=use_calcite)
-        result = optimizer.optimize(sql)
+        optimizer = OptimizerService(schema, seed_db_connection=seed_db, use_calcite=use_calcite,
+                                     enable_actual_execution=enable_actual_execution)
+        result = optimizer.optimize(sql, enable_actual_execution=enable_actual_execution)
 
         response_serializer = OptimizeResponseSerializer(data=result)
         response_serializer.is_valid(raise_exception=True)
@@ -482,62 +577,11 @@ class GenerateQueryView(APIView):
         return line
 
     def _parse_schema_string(self, schema_str: str) -> Dict[str, Any]:
-        """
-        Parse schema string format into dict format.
-
-        Input formats supported:
-        - "tables: employees(id, name, salary), departments(id, name)"
-        - "table: users(id, email, password)"
-        - "employees(id, name, salary), departments(id, name)"
-        - "employees(id, name, salary)"
-        - "tables: customers(id, name), orders(id, customer_id); relationships: customers.id -> orders.customer_id"
-
-        Output: {"tables": {"employees": {"columns": {"id": "integer", "name": "text", "salary": "numeric"}}, ...}, "relationships": [...]}
-        """
-        import re
-        result = {"tables": {}, "relationships": []}
-
-        # Try to extract tables part with "tables:" or "table:" prefix
-        tables_match = re.search(r'tables?:\s*(.+?)(?:\s*;|$)', schema_str, re.IGNORECASE)
-        if tables_match:
-            tables_part = tables_match.group(1)
-        else:
-            # Assume the whole string is the tables part
-            tables_part = schema_str
-
-        # Parse each table: table_name(col1, col2, ...)
-        table_pattern = r'(\w+)\s*\(([^)]+)\)'
-        for match in re.finditer(table_pattern, tables_part):
-            table_name = match.group(1)
-            cols_str = match.group(2)
-            columns = {}
-            for col in cols_str.split(','):
-                col = col.strip()
-                if col:
-                    # Default to text type if no type specified
-                    columns[col] = "text"
-            result["tables"][table_name] = {"columns": columns}
-
-        # Try to extract relationships part
-        rel_match = re.search(r'relationships?:\s*(.+)$', schema_str, re.IGNORECASE)
-        if rel_match:
-            rel_part = rel_match.group(1)
-            # Parse relationships: from_table.from_col -> to_table.to_col
-            rel_pattern = r'(\w+)\.(\w+)\s*(?:->|->>)\s*(\w+)\.(\w+)'
-            for match in re.finditer(rel_pattern, rel_part):
-                from_table = match.group(1)
-                from_col = match.group(2)
-                to_table = match.group(3)
-                to_col = match.group(4)
-                result["relationships"].append({
-                    "from_table": from_table,
-                    "from_column": from_col,
-                    "to_table": to_table,
-                    "to_column": to_col,
-                    "type": "one_to_many"
-                })
-
-        return result
+        """Parse a schema string into dict format (delegates to the shared
+        module-level ``parse_schema_string`` so all features honor the same
+        structure: column types, primary keys, not-null flags, indexes, and
+        relationship types are all preserved)."""
+        return parse_schema_string(schema_str)
 
     def _get_default_schema(self) -> Dict[str, Any]:
         """Provide a default schema for common tables when none is given."""

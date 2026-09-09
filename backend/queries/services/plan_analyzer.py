@@ -102,6 +102,10 @@ class PlanNodeMetrics:
     # SubPlan info
     subplan_name: Optional[str] = None
 
+    # Parallelism (PostgreSQL emits these on the Gather / Gather Merge node)
+    workers_planned: Optional[int] = None
+    workers_launched: Optional[int] = None
+
     # Buffers (when available)
     shared_hit_blocks: Optional[int] = None
     shared_read_blocks: Optional[int] = None
@@ -121,6 +125,7 @@ class PlanNodeMetrics:
     estimated_rows_per_loop: float = 0.0
     actual_rows_per_loop: float = 0.0
     estimation_error_ratio: Optional[float] = None
+    estimation_error_symmetric: Optional[float] = None
 
     def __post_init__(self):
         if self.plan_rows > 0:
@@ -129,6 +134,45 @@ class PlanNodeMetrics:
             self.actual_rows_per_loop = self.actual_rows / self.actual_loops
         if self.actual_rows is not None and self.plan_rows > 0:
             self.estimation_error_ratio = self.actual_rows / self.plan_rows
+            self.estimation_error_symmetric = self._symmetric_error(
+                self.actual_rows, self.plan_rows
+            )
+
+    @staticmethod
+    def _symmetric_error(actual, estimated) -> float:
+        """max(actual/estimated, estimated/actual) with safe zero handling."""
+        try:
+            actual = float(actual)
+            estimated = float(estimated)
+        except (TypeError, ValueError):
+            return 0.0
+        if actual <= 0 and estimated <= 0:
+            return 0.0
+        if estimated <= 0:
+            return 1000.0 if actual > 0 else 0.0
+        if actual <= 0:
+            return estimated
+        return max(actual / estimated, estimated / actual)
+
+    def recompute_row_metrics(self):
+        """Recompute derived row metrics after actual metrics are assigned.
+
+        ``__post_init__`` runs before ``_parse_plan_node`` assigns ``actual_rows``,
+        so derived row metrics must be refreshed once the node is fully populated.
+        """
+        self.estimated_rows_per_loop = 0.0
+        self.actual_rows_per_loop = 0.0
+        self.estimation_error_ratio = None
+        self.estimation_error_symmetric = None
+        if self.plan_rows and self.plan_rows > 0:
+            self.estimated_rows_per_loop = self.plan_rows
+        if self.actual_rows is not None and self.actual_loops and self.actual_loops > 0:
+            self.actual_rows_per_loop = self.actual_rows / self.actual_loops
+        if self.actual_rows is not None and self.plan_rows and self.plan_rows > 0:
+            self.estimation_error_ratio = self.actual_rows / self.plan_rows
+            self.estimation_error_symmetric = self._symmetric_error(
+                self.actual_rows, self.plan_rows
+            )
 
 
 @dataclass
@@ -193,6 +237,21 @@ class PlanAnalysis:
     cost_source: str = "postgresql_explain"
     explain_analyze: bool = False
 
+    # Enhanced metrics (additive - appended to to_dict, existing keys unchanged)
+    planning_time: Optional[float] = None          # Planning Time (ms)
+    total_execution_time: Optional[float] = None   # Execution Time (ms)
+    total_actual_rows: float = 0.0                 # Sum of actual rows across nodes
+    shared_buffers: Dict[str, int] = field(default_factory=dict)   # hit/read/dirtied/written totals
+    temp_buffers: Dict[str, int] = field(default_factory=dict)     # read/written block totals
+    parallel_workers_planned: int = 0
+    parallel_workers_launched: int = 0
+    has_sort_in_plan: bool = False
+    buffer_total: int = 0                          # total blocks touched (shared hit+read)
+    symmetric_max_error: float = 0.0
+    symmetric_avg_error: float = 0.0
+    row_estimation_quality: str = "GOOD"
+    row_estimation_thresholds: Optional[Dict[str, float]] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
@@ -231,6 +290,9 @@ class PlanAnalysis:
                 'max_error': self.max_estimation_error,
                 'avg_error': self.avg_estimation_error,
                 'nodes_with_error': self.estimation_error_nodes,
+                'symmetric_max_error': self.symmetric_max_error,
+                'symmetric_avg_error': self.symmetric_avg_error,
+                'quality': self.row_estimation_quality,
             },
             'scan_efficiency': {
                 'tables_scanned': self.tables_scanned,
@@ -243,6 +305,16 @@ class PlanAnalysis:
             'subplan_details': self.subplan_details,
             'cost_source': self.cost_source,
             'explain_analyze': self.explain_analyze,
+            # Enhanced metrics (additive)
+            'planning_time': self.planning_time,
+            'total_execution_time': self.total_execution_time,
+            'total_actual_rows': self.total_actual_rows,
+            'buffers': self.shared_buffers,
+            'temp_buffers': self.temp_buffers,
+            'buffer_total': self.buffer_total,
+            'parallel_workers_planned': self.parallel_workers_planned,
+            'parallel_workers_launched': self.parallel_workers_launched,
+            'has_sort_in_plan': self.has_sort_in_plan,
         }
 
 
@@ -251,16 +323,19 @@ class PlanAnalyzer:
     Analyzes PostgreSQL EXPLAIN (FORMAT JSON) output to extract performance features.
     """
 
-    def __init__(self):
+    def __init__(self, thresholds: Optional[Dict[str, float]] = None):
         self._node_stack: List[PlanNodeMetrics] = []
+        self.thresholds = thresholds
 
-    def analyze(self, explain_json: List[Dict[str, Any]], explain_analyze: bool = False) -> PlanAnalysis:
+    def analyze(self, explain_json: List[Dict[str, Any]], explain_analyze: bool = False,
+                thresholds: Optional[Dict[str, float]] = None) -> PlanAnalysis:
         """
         Analyze a PostgreSQL EXPLAIN plan.
 
         Args:
             explain_json: Parsed JSON from EXPLAIN (FORMAT JSON)
             explain_analyze: Whether ANALYZE was run (actual metrics available)
+            thresholds: Optional row-estimation thresholds {good, moderate, poor}
 
         Returns:
             PlanAnalysis with extracted metrics
@@ -271,7 +346,7 @@ class PlanAnalyzer:
 
         # PostgreSQL EXPLAIN JSON wraps the plan in a list with a 'Plan' key
         plan_data = explain_json[0] if explain_json else {}
-        if 'Plan' not in plan_data:
+        if not isinstance(plan_data, dict) or not isinstance(plan_data.get('Plan'), dict):
             logger.warning("No 'Plan' key in EXPLAIN output")
             return self._empty_analysis()
 
@@ -281,11 +356,45 @@ class PlanAnalyzer:
             root=root_node,
             explain_analyze=explain_analyze,
         )
+        if thresholds is not None:
+            analysis.row_estimation_thresholds = thresholds
+
+        # Extract top-level timing / buffer / parallelism info
+        self._extract_top_level(plan_data, analysis)
 
         # Aggregate metrics from the tree
         self._aggregate_metrics(root_node, analysis)
 
+        # Classify row-estimation quality from symmetric errors
+        analysis.row_estimation_quality = self._classify_row_estimation(
+            analysis.symmetric_avg_error,
+            analysis.row_estimation_thresholds or self.thresholds,
+        )
+
         return analysis
+
+    def _extract_top_level(self, plan_data: Dict[str, Any], analysis: PlanAnalysis):
+        """Extract top-level EXPLAIN keys: timing, parallelism.
+
+        Buffer blocks live per-node in EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) and
+        are aggregated during the tree walk (see ``_walk_tree``). A few tools also
+        emit a top-level ``Buffers`` dict, which we accept defensively.
+        """
+        if 'Planning Time' in plan_data:
+            analysis.planning_time = plan_data.get('Planning Time')
+        if 'Execution Time' in plan_data:
+            analysis.total_execution_time = plan_data.get('Execution Time')
+
+        # Defensive: accept an explicit top-level 'Buffers' block if present.
+        buffers_block = plan_data.get('Buffers')
+        if isinstance(buffers_block, dict):
+            for key, val in buffers_block.items():
+                if isinstance(val, (int, float)):
+                    analysis.shared_buffers[str(key)] = int(val)
+
+        # Parallelism
+        analysis.parallel_workers_planned = plan_data.get('Workers Planned', 0) or 0
+        analysis.parallel_workers_launched = plan_data.get('Workers Launched', 0) or 0
 
     def _empty_analysis(self) -> PlanAnalysis:
         """Return an empty analysis for error cases."""
@@ -341,6 +450,10 @@ class PlanAnalyzer:
         # SubPlan
         metrics.subplan_name = node.get('Subplan Name')
 
+        # Parallelism (on the Gather node in FORMAT JSON)
+        metrics.workers_planned = node.get('Workers Planned')
+        metrics.workers_launched = node.get('Workers Launched')
+
         # Buffer info (when available)
         metrics.shared_hit_blocks = node.get('Shared Hit Blocks')
         metrics.shared_read_blocks = node.get('Shared Read Blocks')
@@ -363,6 +476,10 @@ class PlanAnalyzer:
                 elif isinstance(child_list, dict):
                     metrics.children.append(self._parse_plan_node(child_list, depth + 1))
 
+        # Refresh derived row metrics now that actual metrics are populated
+        # (__post_init__ ran before actual_rows was assigned).
+        metrics.recompute_row_metrics()
+
         return metrics
 
     def _aggregate_metrics(self, node: PlanNodeMetrics, analysis: PlanAnalysis):
@@ -373,11 +490,15 @@ class PlanAnalyzer:
         analysis.total_plan_rows = node.plan_rows
 
         # Walk the tree and collect metrics
+        self._symmetric_error_sum = 0.0
         self._walk_tree(node, analysis)
 
-        # Calculate average estimation error
+        # Calculate average estimation error = SUM / COUNT (fix: was MAX / COUNT)
         if analysis.estimation_error_nodes > 0:
-            analysis.avg_estimation_error = analysis.max_estimation_error / analysis.estimation_error_nodes
+            analysis.avg_estimation_error = (
+                self._symmetric_error_sum / analysis.estimation_error_nodes
+            )
+            analysis.symmetric_avg_error = analysis.avg_estimation_error
 
     def _walk_tree(self, node: PlanNodeMetrics, analysis: PlanAnalysis):
         """Recursively walk the plan tree and collect metrics."""
@@ -400,11 +521,10 @@ class PlanAnalyzer:
                 analysis.indexes_used.append(node.index_name)
             analysis.scan_cost += node.total_cost
 
-        elif 'Index Scan' in node_type:
-            analysis.index_scans += 1
-            if node.relation_name:
-                analysis.tables_scanned.append(node.relation_name)
-                analysis.index_scan_tables.append(node.relation_name)
+        elif 'Bitmap Index Scan' in node_type:
+            # Must precede the generic 'Index Scan' check — 'Bitmap Index Scan'
+            # contains 'Index Scan' as a substring.
+            analysis.bitmap_index_scans += 1
             if node.index_name:
                 analysis.indexes_used.append(node.index_name)
             analysis.scan_cost += node.total_cost
@@ -415,8 +535,11 @@ class PlanAnalyzer:
                 analysis.tables_scanned.append(node.relation_name)
             analysis.scan_cost += node.total_cost
 
-        elif 'Bitmap Index Scan' in node_type:
-            analysis.bitmap_index_scans += 1
+        elif 'Index Scan' in node_type:
+            analysis.index_scans += 1
+            if node.relation_name:
+                analysis.tables_scanned.append(node.relation_name)
+                analysis.index_scan_tables.append(node.relation_name)
             if node.index_name:
                 analysis.indexes_used.append(node.index_name)
             analysis.scan_cost += node.total_cost
@@ -521,17 +644,94 @@ class PlanAnalyzer:
         else:
             analysis.other_cost += node.total_cost
 
-        # Track row estimation quality
-        if node.estimation_error_ratio is not None:
+        # Track actual rows
+        if node.actual_rows is not None:
+            analysis.total_actual_rows += node.actual_rows
+
+        # Parallelism (max across the tree; some workers may only be planned)
+        if node.workers_planned is not None:
+            analysis.parallel_workers_planned = max(
+                analysis.parallel_workers_planned, int(node.workers_planned or 0)
+            )
+        if node.workers_launched is not None:
+            analysis.parallel_workers_launched = max(
+                analysis.parallel_workers_launched, int(node.workers_launched or 0)
+            )
+
+        # Track sort presence
+        if node_type in ('Sort', 'Incremental Sort'):
+            analysis.has_sort_in_plan = True
+
+        # Accumulate per-node buffer usage (EXPLAIN ANALYZE BUFFERS)
+        self._accumulate_buffers(node, analysis)
+
+        # Track row estimation quality (symmetric error)
+        if node.estimation_error_symmetric is not None:
             analysis.estimation_error_nodes += 1
-            error_ratio = node.estimation_error_ratio
-            analysis.max_estimation_error = max(analysis.max_estimation_error, error_ratio)
+            err = node.estimation_error_symmetric
+            self._symmetric_error_sum += err
+            analysis.symmetric_max_error = max(analysis.symmetric_max_error, err)
+            # Legacy ratio-based max preserved for backward compatibility
+            if node.estimation_error_ratio is not None:
+                analysis.max_estimation_error = max(
+                    analysis.max_estimation_error, abs(node.estimation_error_ratio)
+                )
 
         # Recurse into children
         for child in node.children:
             self._walk_tree(child, analysis)
 
+    @staticmethod
+    def _accumulate_buffers(node: 'PlanNodeMetrics', analysis: PlanAnalysis):
+        """Add this node's buffer blocks to the analysis-wide totals."""
+        s_keys = (
+            ('shared_hit_blocks', 'Shared Hit Blocks'),
+            ('shared_read_blocks', 'Shared Read Blocks'),
+            ('shared_dirtied_blocks', 'Shared Dirtied Blocks'),
+            ('shared_written_blocks', 'Shared Written Blocks'),
+            ('local_hit_blocks', 'Local Hit Blocks'),
+            ('local_read_blocks', 'Local Read Blocks'),
+        )
+        for attr, label in s_keys:
+            val = getattr(node, attr, None)
+            if val is not None:
+                analysis.shared_buffers[label] = (
+                    analysis.shared_buffers.get(label, 0) + val
+                )
+        analysis.buffer_total = (
+            analysis.shared_buffers.get('Shared Hit Blocks', 0)
+            + analysis.shared_buffers.get('Shared Read Blocks', 0)
+        )
 
-def create_plan_analyzer() -> PlanAnalyzer:
+        temp_read = getattr(node, 'temp_read_blocks', None)
+        temp_written = getattr(node, 'temp_written_blocks', None)
+        if temp_read is not None or temp_written is not None:
+            t_r = analysis.temp_buffers.get('read', 0)
+            t_w = analysis.temp_buffers.get('written', 0)
+            if temp_read is not None:
+                t_r += temp_read
+            if temp_written is not None:
+                t_w += temp_written
+            analysis.temp_buffers = {'read': t_r, 'written': t_w}
+
+
+    @staticmethod
+    def _classify_row_estimation(error: float,
+                                 thresholds: Optional[Dict[str, float]]) -> str:
+        """Classify an average symmetric error into GOOD/MODERATE/POOR/SEVERE."""
+        th = thresholds or {}
+        good = th.get('good', 2.0)
+        moderate = th.get('moderate', 5.0)
+        poor = th.get('poor', 10.0)
+        if error < good:
+            return 'GOOD'
+        if error < moderate:
+            return 'MODERATE'
+        if error < poor:
+            return 'POOR'
+        return 'SEVERE'
+
+
+def create_plan_analyzer(thresholds: Optional[Dict[str, float]] = None) -> PlanAnalyzer:
     """Factory function to create a PlanAnalyzer instance."""
-    return PlanAnalyzer()
+    return PlanAnalyzer(thresholds=thresholds)

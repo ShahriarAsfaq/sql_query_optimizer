@@ -288,6 +288,16 @@ class SemanticValidator:
                 ],
                 applies_to=['WHERE x IN (SELECT ...)'],
             ),
+            'qualify_columns': RewriteRule(
+                name='qualify_columns',
+                description='Added table aliases, qualified unqualified column references, and resolved CURRENT_YEAR placeholder to the current year',
+                safety=SemanticSafety.CONDITIONALLY_SAFE,
+                conditions=[
+                    'Schema must map each column to exactly one table for unambiguous qualification',
+                    'CURRENT_YEAR is an app-generated unresolved placeholder intended as the current calendar year',
+                    'Qualification does not change which tables/rows are referenced',
+                ],
+            ),
         }
 
     def _check_conditional_safety(

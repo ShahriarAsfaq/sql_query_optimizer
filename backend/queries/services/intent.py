@@ -729,11 +729,34 @@ JSON:"""
         return intent.to_dict()
 
     def _summarize_schema(self, schema: Dict[str, Any]) -> str:
-        """Create a brief schema summary for LLM context."""
+        """Create a brief schema summary for LLM context.
+
+        Includes each column's type and constraints (primary_key / not_null /
+        unique) so the LLM can honor the user's schema structure when generating
+        SQL, instead of seeing only bare column names.
+        """
         lines = []
         for table_name, table_def in schema.get('tables', {}).items():
-            cols = list(table_def.get('columns', {}).keys())
-            lines.append(f"  {table_name}: {', '.join(cols)}")
+            col_parts = []
+            for col_name, col_def in table_def.get('columns', {}).items():
+                if isinstance(col_def, dict):
+                    col_type = col_def.get('type', 'text')
+                    flags = []
+                    if col_def.get('primary_key'):
+                        flags.append('primary_key')
+                    if col_def.get('not_null'):
+                        flags.append('not_null')
+                    if col_def.get('unique'):
+                        flags.append('unique')
+                    col_str = f"{col_name}:{col_type}"
+                    if flags:
+                        col_str += " (" + ", ".join(flags) + ")"
+                    col_parts.append(col_str)
+                elif col_def:
+                    col_parts.append(f"{col_name}:{col_def}")
+                else:
+                    col_parts.append(col_name)
+            lines.append(f"  {table_name}: {', '.join(col_parts)}")
         return "\n".join(lines)
 
     def _find_entity(self, text: str, schema: Dict[str, Any]) -> Optional[str]:

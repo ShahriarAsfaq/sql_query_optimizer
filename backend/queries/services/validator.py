@@ -218,6 +218,12 @@ class ValidationService:
                     suggestion=f"Available tables: {', '.join(self.tables.keys())}"
                 ))
 
+        # Build alias -> table resolution map from parsed tables
+        alias_to_table = {}
+        for tr in parsed.tables:
+            if tr.alias:
+                alias_to_table[tr.alias.lower()] = tr.name.lower()
+
         # Check columns
         for col_ref in parsed.columns:
             if col_ref.name == '*':
@@ -229,6 +235,9 @@ class ValidationService:
                 continue
 
             table_name = (col_ref.table or '').lower()
+            # Resolve alias to actual table name for schema validation
+            if table_name in alias_to_table:
+                table_name = alias_to_table[table_name]
             col_name = col_ref.name.lower()
 
             # If column has explicit table, validate against that table

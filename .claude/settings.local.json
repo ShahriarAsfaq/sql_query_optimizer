@@ -8,7 +8,8 @@
       "Bash(curl -X POST http://localhost:8000/api/queries/optimize/ -H \"Content-Type: application/json\" -H \"Authorization: Api-Key dev-key-12345\" -d @-)",
       "Bash(curl -X POST http://localhost:8000/api/queries/optimize/ -H \"Content-Type: application/json\" -H \"Authorization: Api-Key dev-key-12345\" -d '{\"sql\": \"SELECT * FROM employees WHERE salary > 100000\", \"dialect\": \"postgresql\"}')",
       "Bash(curl -X POST http://localhost:8000/api/queries/analyze/ -H \"Content-Type: application/json\" -H \"Authorization: Api-Key dev-key-12345\" -d '{\"sql\": \"SELECT * FROM employees WHERE salary > 100000\", \"explain\": true, \"schema\": {\"tables\": {\"employees\": {\"columns\": {\"id\": {\"type\": \"integer\"}, \"first_name\": {\"type\": \"string\"}, \"last_name\": {\"type\": \"string\"}, \"salary\": {\"type\": \"integer\"}, \"department_id\": {\"type\": \"integer\"}}}}}')",
-      "Bash(curl -X POST http://localhost:8000/api/queries/analyze/ -H \"Content-Type: application/json\" -H \"Authorization: Api-Key dev-key-12345\" -d @-)"
+      "Bash(curl -X POST http://localhost:8000/api/queries/analyze/ -H \"Content-Type: application/json\" -H \"Authorization: Api-Key dev-key-12345\" -d @-)",
+      "Bash(python -c ' *)"
     ]
   }
 }

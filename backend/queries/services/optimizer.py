@@ -6,6 +6,7 @@ from dataclasses import dataclass, asdict, field
 import logging
 import re
 import copy
+from datetime import datetime
 
 from .sql_parser import get_parser, ParsedQuery, SQLParserService
 from .validator import ValidationService, ValidationIssue, ValidationSeverity
@@ -14,6 +15,19 @@ from ..services.llm_client import LLMClient, MockLLMClient
 from .calcite_client import CalciteClient, CalciteOptimizeResult
 from .plan_analyzer import PlanAnalyzer, PlanAnalysis, PlanNodeMetrics, create_plan_analyzer
 from .semantic_validator import SemanticValidator, SemanticSafety, SemanticCheckResult
+from .query_analyzer import analyze_query_structure, QueryStructure
+from .opportunity_detector import detect_optimization_opportunities, opportunity_list_to_dicts, OptimizationOpportunity
+from .rewrite_engine import RewriteEngine
+from .index_advisor import recommend_indexes, detect_redundant_indexes, IndexRecommendation, index_advice_to_dicts
+from .statistics_analyzer import analyze_statistics, StatisticsRecommendation
+from .candidate_ranker import (
+    compute_performance_score, rank_candidates, assess_confidence,
+    performance_improvement_pct, ConfidenceLevel, EvidenceSource, PerformanceScore
+)
+from .cost_model import HeuristicCostModel, estimate_cost_from_structure
+from .optimization_reasoning import (
+    OptimizationReasoning, compare_plans, decide_strategy,
+)
 from ml_services.ml_service import get_ml_service
 
 logger = logging.getLogger(__name__)
@@ -43,6 +57,22 @@ class CandidateQuery:
     cost_change_percent: Optional[float] = None
     rewrite_rules_applied: List[str] = field(default_factory=list)
 
+    # --- Phase 9 additive fields ---
+    semantic_risk: str = "LOW"              # LOW | MEDIUM | HIGH
+    plan_metrics: Optional[Dict[str, Any]] = None
+    optimization_opportunities: List[Dict[str, Any]] = field(default_factory=list)
+    index_recommendations: List[Dict[str, Any]] = field(default_factory=list)
+    statistics_recommendations: List[Dict[str, Any]] = field(default_factory=list)
+    evidence_quality: str = "HEURISTIC"     # EXPLAIN_ANALYZE | EXPLAIN | SCHEMA_STATS | HEURISTIC
+    actual_execution_time: Optional[float] = None
+    planning_time: Optional[float] = None
+    execution_time: Optional[float] = None
+    row_estimation_quality: Optional[str] = None
+    performance_improvement: Optional[str] = None
+    evidence_source: str = "HEURISTIC"
+    confidence_level: str = "LOW"
+    confidence_score: float = 0.0
+
     def __post_init__(self):
         if self.validation_errors is None:
             self.validation_errors = []
@@ -52,6 +82,12 @@ class CandidateQuery:
             self.optimization_reasons = []
         if self.rewrite_rules_applied is None:
             self.rewrite_rules_applied = []
+        if self.optimization_opportunities is None:
+            self.optimization_opportunities = []
+        if self.index_recommendations is None:
+            self.index_recommendations = []
+        if self.statistics_recommendations is None:
+            self.statistics_recommendations = []
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -72,6 +108,24 @@ class CandidateQuery:
             'performance_score': self.performance_score,
             'cost_change_percent': self.cost_change_percent,
             'rewrite_rules_applied': self.rewrite_rules_applied,
+            # New additive fields (backward compatible)
+            'semantic_risk': self.semantic_risk,
+            'plan_metrics': self.plan_metrics,
+            'optimization_opportunities': [
+                o.to_dict() if hasattr(o, 'to_dict') else o
+                for o in (self.optimization_opportunities or [])
+            ],
+            'index_recommendations': self.index_recommendations,
+            'statistics_recommendations': self.statistics_recommendations,
+            'evidence_quality': self.evidence_quality,
+            'actual_execution_time': self.actual_execution_time,
+            'planning_time': self.planning_time,
+            'execution_time': self.execution_time,
+            'row_estimation_quality': self.row_estimation_quality,
+            'performance_improvement': self.performance_improvement,
+            'evidence_source': self.evidence_source,
+            'confidence_level': self.confidence_level,
+            'confidence_score': self.confidence_score,
         }
         if self.plan_analysis:
             result['plan_analysis'] = self.plan_analysis.to_dict()
@@ -84,8 +138,17 @@ class OptimizerService:
     Supports both rule-based (built-in) and Calcite-based optimization.
     """
 
-    def __init__(self, schema: Optional[Dict[str, Any]] = None, seed_db_connection=None,
-                 llm_client=None, use_mock_llm: bool = False, use_calcite: bool = True):
+    def __init__(
+        self,
+        schema: Optional[Dict[str, Any]] = None,
+        seed_db_connection=None,
+        llm_client=None,
+        use_mock_llm: bool = False,
+        use_calcite: bool = True,
+        enable_actual_execution: bool = False,
+        row_estimation_thresholds: Optional[Dict[str, float]] = None,
+        optimization_limits: Optional[Dict[str, Any]] = None,
+    ):
         """
         Initialize optimizer service.
 
@@ -95,6 +158,11 @@ class OptimizerService:
             llm_client: LLM client for intent extraction
             use_mock_llm: Use mock LLM for testing
             use_calcite: Whether to use Calcite server for optimization
+            enable_actual_execution: If True, run EXPLAIN ANALYZE for SELECT/WITH queries.
+                                     NEVER runs on DML. Default False.
+            row_estimation_thresholds: Custom thresholds for row estimation quality
+                                       (GOOD < x, MODERATE x-y, POOR y-z, SEVERE > z).
+            optimization_limits: Limits for candidate generation (max_candidates, etc.).
         """
         self.schema = schema or {}
         self.seed_db = seed_db_connection
@@ -106,11 +174,20 @@ class OptimizerService:
         self.use_calcite = use_calcite
         self.calcite_client = CalciteClient() if use_calcite else None
 
-        # New: Plan analyzer for EXPLAIN-based performance scoring
-        self.plan_analyzer = create_plan_analyzer()
+        # Plan analyzer for EXPLAIN-based performance scoring
+        self.plan_analyzer = create_plan_analyzer(thresholds=row_estimation_thresholds)
 
-        # New: Semantic validator for rewrite safety checking
+        # Semantic validator for rewrite safety checking
         self.semantic_validator = SemanticValidator(self.schema)
+
+        # New modules
+        self.rewrite_engine = RewriteEngine(self.schema)
+        self.cost_model = HeuristicCostModel(self.schema)
+        self.index_advisor_thresholds = row_estimation_thresholds or {}
+        self.optimization_limits = optimization_limits or {}
+
+        # EXPLAIN ANALYZE safety flag
+        self.enable_actual_execution = enable_actual_execution
 
     def optimize(self, sql: str) -> Dict[str, Any]:
         """
@@ -155,6 +232,30 @@ class OptimizerService:
         # Compute complexity score from original parsed query
         complexity_score = self._compute_complexity_score(original_parsed, sql)
 
+        # Reasoning layer (additive) — intents + heuristic cost flow + strategy.
+        # No baseline plan exists on the Calcite path, so evidence is heuristic.
+        query_structure = analyze_query_structure(original_parsed, sql, self.schema)
+        reasoning = OptimizationReasoning(
+            query_structure, self.schema, None, None, False, [])
+        has_calcite_rules = bool(calcite_result.rules_applied)
+        calcite_strategy = {
+            'result_state': 'SQL_REWRITE' if has_calcite_rules else 'NO_CHANGE_REQUIRED',
+            'strategy_candidates': [
+                {'type': 'SQL_REWRITE',
+                 'action': ', '.join(calcite_result.rules_applied[:5]),
+                 'rationale': 'Calcite applied optimizer rules to the query.',
+                 'evidence': calcite_result.optimized_sql or '',
+                 'confidence': 0.65} if has_calcite_rules else
+                {'type': 'NO_SQL_CHANGE',
+                 'action': '',
+                 'rationale': 'Calcite applied no rules; query left unchanged.',
+                 'evidence': '',
+                 'confidence': 0.5},
+            ],
+            'decision_path': ['calcite rules applied' if has_calcite_rules
+                              else 'no calcite rules applied'],
+        }
+
         # The optimized_sql from Calcite is a logical plan - we present it as the optimization result
         # but keep the original SQL as the actual query
         candidate = {
@@ -167,6 +268,21 @@ class OptimizerService:
             'calcite_optimized_plan': calcite_result.optimized_sql,  # Store the logical plan
             'calcite_rules_applied': calcite_result.rules_applied,
             'calcite_explain_plan': calcite_result.explain_plan,
+            # New fields for normalized response shape
+            'semantic_risk': 'LOW',
+            'evidence_quality': 'CALCITE',
+            'evidence_source': 'CALCITE',
+            'confidence_level': 'MEDIUM',
+            'confidence_score': 0.65,
+            'performance_improvement': None,
+            'optimization_opportunities': [],
+            'index_recommendations': [],
+            'statistics_recommendations': [],
+            'plan_metrics': None,
+            'actual_execution_time': None,
+            'planning_time': None,
+            'execution_time': None,
+            'row_estimation_quality': None,
         }
 
         return {
@@ -174,17 +290,51 @@ class OptimizerService:
             'original_cost': calcite_result.original_cost,
             'candidates': [candidate],
             'best_candidate': candidate,
+            # New top-level fields for normalized shape
+            'sql_optimizations': [{
+                'sql': sql,
+                'description': candidate['description'],
+                'estimated_cost': calcite_result.optimized_cost,
+                'performance_score': None,
+                'cost_change_percent': None,
+                'rewrite_rules_applied': calcite_result.rules_applied,
+                'semantic_risk': 'LOW',
+                'evidence_quality': 'CALCITE',
+                'confidence_level': 'MEDIUM',
+            }],
+            'index_recommendations': [],
+            'statistics_recommendations': [],
+            'warnings': [],
+            'opportunities': [],
+            'evidence_source': 'CALCITE',
+            'heuristic_used': False,
+            # --- Thinking engine (additive, heuristic evidence) ---
+            'query_intent': reasoning.intent.to_dict(),
+            'cost_flow': reasoning.cost_flow.to_dict(),
+            'reasoning': reasoning.to_dict(),
+            'optimization_strategy': calcite_strategy,
+            'plan_comparison': None,
         }
 
-    def _optimize_builtin(self, sql: str) -> Dict[str, Any]:
-        """New performance-driven optimization pipeline with semantic validation.
+    def _optimize_builtin(self, sql: str, enable_actual_execution: Optional[bool] = None) -> Dict[str, Any]:
+        """
+        New evidence-driven optimization pipeline.
 
         Pipeline:
-        Original SQL -> Generate Candidates (with rewrite rules) -> Parse Each
-        -> Schema Validation -> Semantic Validation -> EXPLAIN Each -> Plan Analysis
-        -> Performance Scoring -> Layered Ranking -> Best Candidate
+        1. Parse & validate original query
+        2. Analyze query structure (QueryStructure)
+        3. Baseline EXPLAIN (optionally ANALYZE behind flag) -> PlanAnalysis
+        4. Detect optimization opportunities + statistics analysis
+        5. Generate candidates (existing rules + RewriteEngine new rules)
+        6. Per-candidate pipeline (validation, EXPLAIN, analysis) + attach opportunities + index/statistics recs + evidence_quality + semantic_risk
+        7. Index recommendations + redundant index detection
+        8. Candidate ranking + confidence assessment
+        9. Enriched response
         """
-        # Parse original query
+        # Determine if we should run EXPLAIN ANALYZE
+        run_analyze = self.enable_actual_execution if enable_actual_execution is None else enable_actual_execution
+
+        # Step 1: Parse original query
         original_parsed = self.parser.parse(sql)
         if not original_parsed.is_valid:
             return {
@@ -195,55 +345,149 @@ class OptimizerService:
                 'error': 'Original query is invalid'
             }
 
-        # Get original EXPLAIN plan and analyze
-        original_explain = self._get_explain_plan(sql)
+        # Step 2: Deep query structure analysis
+        query_structure = analyze_query_structure(original_parsed, sql, self.schema)
+
+        # Step 3: Baseline EXPLAIN (and optionally ANALYZE for SELECT/WITH only)
+        original_explain = self._get_explain_plan(sql, analyze=run_analyze)
         original_analysis = self.plan_analyzer.analyze(original_explain) if original_explain else None
         original_cost = original_analysis.total_cost if original_analysis else None
 
-        # Generate candidates with rewrite rule tracking
+        # Step 4: Detect optimization opportunities + statistics analysis
+        baseline_opportunities = detect_optimization_opportunities(query_structure, original_analysis, self.schema)
+        stats_opportunities, stats_recommendations = [], []
+        if self.seed_db:
+            stats_opportunities, stats_recommendations = analyze_statistics(
+                sql, original_parsed, self.seed_db,
+                plan=original_analysis,
+                explain_analyze=original_explain if run_analyze else None,
+                schema=self.schema,
+            )
+        all_opportunities = baseline_opportunities + stats_opportunities
+
+        # Step 4b: Reasoning layer (thinking engine) — additive intent/cost-flow/
+        # top-N/strategy reasoning built from structure + plan + schema. Pure
+        # read-only: never mutates candidates or ranking.
+        reasoning = OptimizationReasoning(
+            query_structure, self.schema, original_analysis, original_explain,
+            run_analyze, all_opportunities
+        )
+
+        # Step 5: Generate candidates (existing rules + new RewriteEngine rules)
         candidates = self._generate_candidates(original_parsed, sql)
+
+        # Add RewriteEngine candidates
+        rewrite_candidates = self._generate_rewrite_engine_candidates(query_structure, sql, original_parsed)
+        candidates.extend(rewrite_candidates)
 
         # Process each candidate through the full pipeline
         scored_candidates = []
         for candidate in candidates:
-            scored = self._process_candidate_pipeline(candidate, original_parsed, original_analysis, sql)
+            scored = self._process_candidate_pipeline(
+                candidate, original_parsed, original_analysis, sql,
+                query_structure, all_opportunities
+            )
             if scored:
                 scored_candidates.append(scored)
 
         # Also include original query as a baseline candidate (for comparison)
-        original_candidate = CandidateQuery(
-            sql=sql,
-            description="Original query (baseline)",
-            cost=original_cost,
-            startup_cost=original_analysis.total_startup_cost if original_analysis else None,
-            plan_rows=original_analysis.total_plan_rows if original_analysis else None,
-            plan_analysis=original_analysis,
-            cost_source="postgresql_explain",
-            semantic_safety="safe",
-            semantic_details=[],
-            optimization_reasons=["Baseline query"],
-            confidence="HIGH",
-            performance_score=1.0,  # Baseline = 1.0
-            cost_change_percent=0.0,
-        )
-        # Parse and validate original
-        original_candidate.validation_passed = original_parsed.is_valid
-        original_candidate.validation_errors = [e.message for e in original_parsed.errors] if not original_parsed.is_valid else []
-        original_candidate.complexity_score = self._compute_complexity_score(original_parsed, sql)
+        original_candidate = self._create_baseline_candidate(sql, original_parsed, original_analysis, original_explain)
         scored_candidates.insert(0, original_candidate)
 
-        # Rank candidates using layered ranking
-        ranked = self._rank_candidates_layered(scored_candidates, original_parsed, original_analysis)
+        # Step 7: Index recommendations (schema + query driven) + redundant index detection
+        index_recommendations = recommend_indexes(query_structure, self.schema, original_analysis)
+        redundant_indexes = detect_redundant_indexes(self.schema)
+
+        # Step 8: Rank candidates using candidate_ranker (layered ranking + evidence-based confidence)
+        ranked = rank_candidates(
+            [c.to_dict() for c in scored_candidates],
+            original_analysis,
+            original_analysis.total_execution_time if original_analysis else None
+        )
+
+        # Convert back to CandidateQuery objects with enriched data
+        enriched_candidates = self._enrich_candidates(ranked, scored_candidates,
+                                                       query_structure, all_opportunities,
+                                                       index_recommendations, redundant_indexes,
+                                                       stats_recommendations,
+                                                       original_analysis,
+                                                       original_analysis.total_execution_time if original_analysis else None)
 
         # Get best candidate (excluding original baseline from "best" if it's the only one)
-        best = ranked[0] if ranked else None
+        best = enriched_candidates[0] if enriched_candidates else None
+
+        # Correctness completion: if the original carries an unresolved
+        # CURRENT_YEAR placeholder and a validated qualify_columns candidate
+        # resolves it, promote that candidate as the recommended output. The
+        # raw query cannot return the intended rows, and EXPLAIN ties (aliases
+        # don't change cost), so the performance ranker alone keeps baseline.
+        # The top_better guard never masks a genuinely faster candidate.
+        resolution_warning = None
+        if re.search(r'CURRENT_YEAR', sql, re.IGNORECASE):
+            resolved = [c for c in enriched_candidates
+                        if c.validation_passed
+                        and 'qualify_columns' in (c.rewrite_rules_applied or [])
+                        and not re.search(r'CURRENT_YEAR', c.sql, re.IGNORECASE)]
+            top = enriched_candidates[0] if enriched_candidates else None
+            top_better = (top is not None
+                          and resolved
+                          and top is not resolved[0]
+                          and (top.performance_score or 0) > (resolved[0].performance_score or 1.0) + 0.001)
+            if resolved and not top_better:
+                best = resolved[0]
+                resolution_warning = (
+                    "Original query contains an unresolved CURRENT_YEAR placeholder; "
+                    f"resolved it to '{datetime.now().year}' in the recommended query."
+                )
+
+        # Reasoning outputs: plan comparison (WHY best beats baseline) and the
+        # final strategy decision tree. Both additive; computed only from
+        # already-available data.
+        plan_comparison = None
+        if best is not None and best.plan_analysis and original_analysis:
+            plan_comparison = compare_plans(original_analysis, best.plan_analysis)
+
+        best_dict = best.to_dict() if best else None
+        if best_dict is not None and plan_comparison is not None:
+            best_dict['improvement_evidence'] = plan_comparison.to_dict()
+
+        strategy = None
+        if enriched_candidates:
+            winning = best.to_dict() if best else None
+            strategy = decide_strategy(
+                query_structure, reasoning.intent, reasoning.cost_flow,
+                reasoning.top_n, reasoning.early_term,
+                list(index_recommendations) + list(redundant_indexes),
+                list(stats_recommendations),
+                baseline_plan=original_analysis,
+                best_candidate=winning,
+                has_plan_evidence=original_analysis is not None,
+            )
+
+        warnings = self._generate_warnings(enriched_candidates, all_opportunities)
+        if resolution_warning:
+            warnings.append(resolution_warning)
 
         return {
             'original_sql': sql,
             'original_cost': original_cost,
             'original_plan_analysis': original_analysis.to_dict() if original_analysis else None,
-            'candidates': [c.to_dict() for c in ranked],
-            'best_candidate': best.to_dict() if best else None,
+            'candidates': [c.to_dict() for c in enriched_candidates],
+            'best_candidate': best_dict,
+            # New top-level fields
+            'sql_optimizations': self._extract_sql_optimizations(enriched_candidates),
+            'index_recommendations': index_advice_to_dicts(index_recommendations + redundant_indexes),
+            'statistics_recommendations': [r.to_dict() for r in stats_recommendations],
+            'warnings': self._generate_warnings(enriched_candidates, all_opportunities),
+            'opportunities': opportunity_list_to_dicts(all_opportunities),
+            'evidence_source': 'EXPLAIN_ANALYZE' if run_analyze and original_analysis and original_analysis.total_execution_time > 0 else 'EXPLAIN',
+            'heuristic_used': original_analysis is None,
+            # --- Thinking engine (additive) ---
+            'query_intent': reasoning.intent.to_dict(),
+            'cost_flow': reasoning.cost_flow.to_dict(),
+            'reasoning': reasoning.to_dict(),
+            'optimization_strategy': strategy.to_dict() if strategy else None,
+            'plan_comparison': plan_comparison.to_dict() if plan_comparison else None,
         }
 
     def _process_candidate_pipeline(
@@ -918,19 +1162,6 @@ class OptimizerService:
         # Fallback: estimate cost based on query structure (mock implementation)
         return self._estimate_cost_from_structure(sql)
 
-    def _get_explain_plan(self, sql: str) -> Optional[Dict[str, Any]]:
-        """Get full EXPLAIN plan from PostgreSQL."""
-        if self.seed_db:
-            try:
-                with self.seed_db.cursor() as cursor:
-                    cursor.execute(f"EXPLAIN (FORMAT JSON) {sql}")
-                    result = cursor.fetchone()
-                    if result and result[0]:
-                        return result[0]
-            except Exception as e:
-                logger.warning(f"EXPLAIN plan failed for query: {e}")
-        return None
-
     def _estimate_cost_from_structure(self, sql: str) -> float:
         """Estimate query cost from structure when EXPLAIN is not available.
 
@@ -1444,3 +1675,432 @@ class OptimizerService:
             select_columns=d.get('select_columns', []),
             raw_text=d.get('raw_text', ''),
         )
+
+    # --- New helper methods for evidence-driven pipeline ---
+
+    def _get_explain_plan(self, sql: str, analyze: bool = False) -> Optional[Dict[str, Any]]:
+        """Get full EXPLAIN plan from PostgreSQL, optionally with ANALYZE.
+
+        Safety: Only runs ANALYZE for SELECT/WITH queries (read-only).
+        """
+        if not self.seed_db:
+            return None
+
+        # Safety check: only run EXPLAIN ANALYZE on SELECT/WITH
+        sql_upper = sql.strip().upper()
+        if analyze:
+            if not (sql_upper.startswith('SELECT') or sql_upper.startswith('WITH')):
+                logger.warning(f"EXPLAIN ANALYZE requested but query is not SELECT/WITH: {sql[:100]}")
+                analyze = False
+
+        try:
+            with self.seed_db.cursor() as cursor:
+                if analyze:
+                    cursor.execute(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}")
+                else:
+                    cursor.execute(f"EXPLAIN (FORMAT JSON) {sql}")
+                result = cursor.fetchone()
+                if result and result[0]:
+                    return result[0]
+        except Exception as e:
+            logger.warning(f"EXPLAIN {'ANALYZE' if analyze else ''} failed: {e}")
+        return None
+
+    def _generate_rewrite_engine_candidates(self, query_structure: QueryStructure, original_sql: str, original_parsed: ParsedQuery) -> List[CandidateQuery]:
+        """Generate candidates using the new RewriteEngine rules."""
+        candidates = []
+
+        # 1. Date function rewrites (YEAR/MONTH/DAY/DATE -> half-open ranges)
+        date_rewrite = self.rewrite_engine.rewrite_date_function(original_sql, original_parsed, query_structure)
+        if date_rewrite and date_rewrite != original_sql:
+            candidates.append(CandidateQuery(
+                sql=date_rewrite,
+                description="Rewrote date function predicate to sargable half-open range",
+                rewrite_rules_applied=['rewrite_date_function_predicate']
+            ))
+
+        # 2. Arithmetic on column rewrites (col + const = val -> col = val - const)
+        arith_rewrite = self.rewrite_engine.rewrite_arithmetic_on_column(original_sql, original_parsed, query_structure)
+        if arith_rewrite and arith_rewrite != original_sql:
+            candidates.append(CandidateQuery(
+                sql=arith_rewrite,
+                description="Rewrote arithmetic on column to sargable form",
+                rewrite_rules_applied=['rewrite_arithmetic_on_column']
+            ))
+
+        # 3. IN to EXISTS rewrite (with NOT NULL gate)
+        in_exists_rewrite = self.rewrite_engine.rewrite_in_to_exists(original_sql, original_parsed, query_structure)
+        if in_exists_rewrite and in_exists_rewrite != original_sql:
+            candidates.append(CandidateQuery(
+                sql=in_exists_rewrite,
+                description="Rewrote IN subquery to EXISTS (NOT NULL verified)",
+                rewrite_rules_applied=['rewrite_in_to_exists']
+            ))
+
+        # 4. DISTINCT removal (PK gate)
+        distinct_rewrite = self.rewrite_engine.rewrite_remove_distinct(original_sql, original_parsed, query_structure)
+        if distinct_rewrite and distinct_rewrite != original_sql:
+            candidates.append(CandidateQuery(
+                sql=distinct_rewrite,
+                description="Removed redundant DISTINCT (primary key projected)",
+                rewrite_rules_applied=['rewrite_remove_distinct']
+            ))
+
+        # 5. UNION to UNION ALL (advisory - requires provable disjointness)
+        union_all_rewrite = self.rewrite_engine.rewrite_union_to_union_all(original_sql, original_parsed, query_structure)
+        if union_all_rewrite and union_all_rewrite != original_sql:
+            candidates.append(CandidateQuery(
+                sql=union_all_rewrite,
+                description="Rewrote UNION to UNION ALL (branches provably disjoint)",
+                rewrite_rules_applied=['rewrite_union_to_union_all']
+            ))
+
+        # 6. CROSS JOIN with FK
+        cross_join_rewrite = self.rewrite_engine.rewrite_cross_join(original_sql, original_parsed, query_structure)
+        if cross_join_rewrite and cross_join_rewrite != original_sql:
+            candidates.append(CandidateQuery(
+                sql=cross_join_rewrite,
+                description="Added FK-based join condition to CROSS JOIN",
+                rewrite_rules_applied=['rewrite_cross_join']
+            ))
+
+        # 7. Filter pushdown before join
+        filter_push_rewrite = self.rewrite_engine.rewrite_filter_before_join(original_sql, original_parsed, query_structure)
+        if filter_push_rewrite and filter_push_rewrite != original_sql:
+            candidates.append(CandidateQuery(
+                sql=filter_push_rewrite,
+                description="Pushed selective filter before join",
+                rewrite_rules_applied=['rewrite_filter_before_join']
+            ))
+
+        # 8. Table alias qualification + CURRENT_YEAR placeholder resolution
+        qualify_rewrite = self.rewrite_engine.rewrite_qualify_columns(original_sql, original_parsed, query_structure)
+        if qualify_rewrite and qualify_rewrite != original_sql:
+            candidates.append(CandidateQuery(
+                sql=qualify_rewrite,
+                description="Qualified unqualified columns with table aliases and resolved CURRENT_YEAR placeholder",
+                rewrite_rules_applied=['qualify_columns']
+            ))
+
+        return candidates
+
+    def _process_candidate_pipeline(
+        self,
+        candidate: CandidateQuery,
+        original_parsed: ParsedQuery,
+        original_analysis: Optional[PlanAnalysis],
+        original_sql: str,
+        query_structure: QueryStructure,
+        all_opportunities: List[Dict[str, Any]]
+    ) -> Optional[CandidateQuery]:
+        """
+        Process a candidate through the full validation and scoring pipeline.
+
+        Steps:
+        1. Parse candidate SQL
+        2. Schema validation (hard constraint - fail fast)
+        3. Semantic validation (hard constraint for UNSAFE rewrites)
+        4. EXPLAIN plan extraction
+        5. Plan analysis
+        6. Performance scoring
+        7. Confidence assessment (evidence-based)
+        8. Attach opportunities, index/statistics recs, evidence_quality, semantic_risk
+        """
+        # Step 1: Parse candidate
+        candidate_parsed = self.parser.parse(candidate.sql)
+        if not candidate_parsed.is_valid:
+            candidate.validation_passed = False
+            candidate.validation_errors = [e.message for e in candidate_parsed.errors]
+            return candidate
+
+        # Step 2: Schema validation (hard constraint)
+        if self.validator:
+            validation = self.validator.validate(candidate_parsed)
+            candidate.validation_passed = validation['is_valid']
+            candidate.validation_errors = [
+                i['message'] for i in validation['issues']
+                if i['severity'] == 'error'
+            ]
+        else:
+            candidate.validation_passed = candidate_parsed.is_valid
+            candidate.validation_errors = [e.message for e in candidate_parsed.errors] if not candidate_parsed.is_valid else []
+
+        if not candidate.validation_passed:
+            return candidate
+
+        # Step 3: Semantic validation (hard constraint for UNSAFE)
+        rewrite_rules_applied = getattr(candidate, 'rewrite_rules_applied', [])
+        semantic_result = self.semantic_validator.validate_candidate(
+            original_sql, candidate.sql,
+            original_parsed, candidate_parsed,
+            rewrite_rules_applied
+        )
+
+        candidate.semantic_safety = semantic_result['semantic_safety']
+        candidate.semantic_details = semantic_result['safety_details']
+        candidate.semantic_risk = semantic_result.get('semantic_risk', 'LOW')
+
+        # HARD CONSTRAINT: Reject UNSAFE rewrites
+        if not semantic_result['semantically_valid']:
+            candidate.validation_passed = False
+            candidate.validation_errors.append(f"Semantic validation failed: {semantic_result['semantic_safety']}")
+            return candidate
+
+        # Step 4: EXPLAIN plan extraction
+        candidate_explain = self._get_explain_plan(candidate.sql)
+
+        # Step 5: Plan analysis
+        if candidate_explain:
+            candidate.plan_analysis = self.plan_analyzer.analyze(candidate_explain)
+            candidate.cost = candidate.plan_analysis.total_cost
+            candidate.startup_cost = candidate.plan_analysis.total_startup_cost
+            candidate.plan_rows = candidate.plan_analysis.total_plan_rows
+            candidate.cost_source = "postgresql_explain"
+            candidate.evidence_quality = "EXPLAIN"
+        else:
+            # Fallback to heuristic cost
+            candidate.cost = self._estimate_cost_from_structure(candidate.sql)
+            candidate.cost_source = "heuristic"
+            candidate.evidence_quality = "HEURISTIC"
+
+        # Step 6: Performance scoring using candidate_ranker
+        if original_analysis and candidate.plan_analysis:
+            score_obj = compute_performance_score(
+                original_analysis, candidate.plan_analysis,
+                original_analysis.total_execution_time,
+                candidate.plan_analysis.total_execution_time
+            )
+            candidate.performance_score = score_obj.total
+            candidate.cost_change_percent = self._calculate_cost_change_percent(
+                original_analysis, candidate.plan_analysis
+            )
+            candidate.performance_improvement = performance_improvement_pct(
+                original_analysis, candidate.plan_analysis,
+                original_analysis.total_execution_time,
+                candidate.plan_analysis.total_execution_time
+            )
+            # Capture plan metrics
+            candidate.plan_metrics = {
+                'total_cost': candidate.plan_analysis.total_cost,
+                'seq_scans': candidate.plan_analysis.seq_scans,
+                'index_scans': candidate.plan_analysis.index_scans,
+                'sorts': candidate.plan_analysis.sorts,
+                'hash_joins': candidate.plan_analysis.hash_joins,
+                'merge_joins': candidate.plan_analysis.merge_joins,
+                'nested_loops': candidate.plan_analysis.nested_loops,
+                'actual_rows': candidate.plan_analysis.total_actual_rows,
+                'estimation_error': candidate.plan_analysis.symmetric_avg_error,
+                'row_estimation_quality': candidate.plan_analysis.row_estimation_quality,
+                'buffer_total': candidate.plan_analysis.buffer_total,
+            }
+            candidate.actual_execution_time = candidate.plan_analysis.total_execution_time
+            candidate.planning_time = candidate.plan_analysis.planning_time
+            candidate.execution_time = candidate.plan_analysis.total_execution_time
+            candidate.row_estimation_quality = candidate.plan_analysis.row_estimation_quality
+        else:
+            candidate.performance_score = None
+            candidate.cost_change_percent = None
+            candidate.performance_improvement = None
+            candidate.evidence_quality = "HEURISTIC"
+
+        # Step 7: Complexity score (secondary signal)
+        candidate.complexity_score = self._compute_complexity_score(candidate_parsed, candidate.sql)
+
+        # Step 8: Generate optimization reasons
+        candidate.optimization_reasons = self._generate_optimization_reasons(
+            candidate, original_analysis, rewrite_rules_applied
+        )
+
+        # Step 9: Attach opportunities relevant to this candidate
+        candidate.optimization_opportunities = all_opportunities
+
+        # Step 10: Index and statistics recommendations (per-candidate)
+        candidate.index_recommendations = []
+        candidate.statistics_recommendations = []
+
+        # Step 11: Evidence-based confidence assessment
+        level, score = assess_confidence(
+            candidate.to_dict(), candidate.plan_analysis, semantic_result
+        )
+        candidate.confidence_level = level
+        candidate.confidence_score = score
+        candidate.evidence_source = candidate.evidence_quality
+
+        return candidate
+
+    def _create_baseline_candidate(
+        self,
+        sql: str,
+        original_parsed: ParsedQuery,
+        original_analysis: Optional[PlanAnalysis],
+        original_explain: Optional[Dict[str, Any]]
+    ) -> CandidateQuery:
+        """Create the baseline candidate (original query) with all enriched fields."""
+        original_candidate = CandidateQuery(
+            sql=sql,
+            description="Original query (baseline)",
+            cost=original_analysis.total_cost if original_analysis else None,
+            startup_cost=original_analysis.total_startup_cost if original_analysis else None,
+            plan_rows=original_analysis.total_plan_rows if original_analysis else None,
+            plan_analysis=original_analysis,
+            cost_source="postgresql_explain" if original_analysis else "heuristic",
+            semantic_safety="safe",
+            semantic_details=[],
+            optimization_reasons=["Baseline query"],
+            confidence="HIGH",
+            performance_score=1.0,
+            cost_change_percent=0.0,
+            semantic_risk="LOW",
+            evidence_quality="EXPLAIN_ANALYZE" if (original_explain and original_analysis and original_analysis.total_execution_time and original_analysis.total_execution_time > 0) else "EXPLAIN" if original_analysis else "HEURISTIC",
+        )
+        # Parse and validate original
+        original_candidate.validation_passed = original_parsed.is_valid
+        original_candidate.validation_errors = [e.message for e in original_parsed.errors] if not original_parsed.is_valid else []
+        original_candidate.complexity_score = self._compute_complexity_score(original_parsed, sql)
+
+        if original_analysis:
+            original_candidate.plan_metrics = {
+                'total_cost': original_analysis.total_cost,
+                'seq_scans': original_analysis.seq_scans,
+                'index_scans': original_analysis.index_scans,
+                'sorts': original_analysis.sorts,
+                'hash_joins': original_analysis.hash_joins,
+                'merge_joins': original_analysis.merge_joins,
+                'nested_loops': original_analysis.nested_loops,
+                'actual_rows': original_analysis.total_actual_rows,
+                'estimation_error': original_analysis.symmetric_avg_error,
+                'row_estimation_quality': original_analysis.row_estimation_quality,
+                'buffer_total': original_analysis.buffer_total,
+            }
+            original_candidate.actual_execution_time = original_analysis.total_execution_time
+            original_candidate.planning_time = original_analysis.planning_time
+            original_candidate.execution_time = original_analysis.total_execution_time
+            original_candidate.row_estimation_quality = original_analysis.row_estimation_quality
+            original_candidate.evidence_source = original_candidate.evidence_quality
+
+        return original_candidate
+
+    def _enrich_candidates(
+        self,
+        ranked_dicts: List[Dict[str, Any]],
+        scored_candidates: List[CandidateQuery],
+        query_structure: QueryStructure,
+        all_opportunities: List[Dict[str, Any]],
+        index_recommendations: List[IndexRecommendation],
+        redundant_indexes: List[IndexRecommendation],
+        stats_recommendations: List[StatisticsRecommendation],
+        original_analysis: Optional[PlanAnalysis],
+        original_time: Optional[float]
+    ) -> List[CandidateQuery]:
+        """Enrich ranked candidate dicts back into CandidateQuery objects with full metadata."""
+        # Build a lookup from SQL to the original CandidateQuery object
+        sql_to_candidate = {c.sql: c for c in scored_candidates}
+
+        enriched = []
+        for rd in ranked_dicts:
+            sql = rd.get('sql', '')
+            candidate = sql_to_candidate.get(sql)
+
+            if candidate:
+                # Update with ranking results
+                candidate.performance_score = rd.get('performance_score', candidate.performance_score)
+                candidate.confidence_level = rd.get('confidence_level', candidate.confidence_level)
+                candidate.confidence_score = rd.get('confidence_score', candidate.confidence_score)
+                candidate.evidence_source = rd.get('evidence_source', candidate.evidence_source)
+                # Attach global index/statistics recommendations
+                candidate.index_recommendations = [r.to_dict() for r in index_recommendations]
+                candidate.statistics_recommendations = [r.to_dict() for r in stats_recommendations]
+                candidate.optimization_opportunities = all_opportunities
+                enriched.append(candidate)
+            else:
+                # Fallback: create from dict
+                from .candidate_ranker import ConfidenceLevel
+                c = CandidateQuery(
+                    sql=sql,
+                    description=rd.get('description', ''),
+                    cost=rd.get('cost'),
+                    performance_score=rd.get('performance_score'),
+                    cost_change_percent=rd.get('cost_change_percent'),
+                    plan_analysis=rd.get('plan_analysis'),
+                    cost_source=rd.get('cost_source', 'heuristic'),
+                    semantic_safety=rd.get('semantic_safety', 'unknown'),
+                    semantic_details=rd.get('semantic_details', []),
+                    optimization_reasons=rd.get('optimization_reasons', []),
+                    confidence=rd.get('confidence', 'LOW'),
+                    semantic_risk=rd.get('semantic_risk', 'LOW'),
+                    evidence_quality=rd.get('evidence_quality', 'HEURISTIC'),
+                    actual_execution_time=rd.get('actual_execution_time'),
+                    planning_time=rd.get('planning_time'),
+                    execution_time=rd.get('execution_time'),
+                    row_estimation_quality=rd.get('row_estimation_quality'),
+                    performance_improvement=rd.get('performance_improvement'),
+                    evidence_source=rd.get('evidence_source', 'HEURISTIC'),
+                    confidence_level=rd.get('confidence_level', 'LOW'),
+                    confidence_score=rd.get('confidence_score', 0.0),
+                    rewrite_rules_applied=rd.get('rewrite_rules_applied', []),
+                )
+                c.optimization_opportunities = all_opportunities
+                c.index_recommendations = [r.to_dict() for r in index_recommendations]
+                c.statistics_recommendations = [r.to_dict() for r in stats_recommendations]
+                enriched.append(c)
+
+        return enriched
+
+    def _extract_sql_optimizations(self, candidates: List[CandidateQuery]) -> List[Dict[str, Any]]:
+        """Extract SQL optimization candidates for top-level response."""
+        optimizations = []
+        for c in candidates:
+            if c.sql and c.description and c != candidates[0]:  # Skip baseline
+                optimizations.append({
+                    'sql': c.sql,
+                    'description': c.description,
+                    'estimated_cost': c.cost,
+                    'performance_score': c.performance_score,
+                    'cost_change_percent': c.cost_change_percent,
+                    'rewrite_rules_applied': c.rewrite_rules_applied,
+                    'semantic_risk': c.semantic_risk,
+                    'evidence_quality': c.evidence_quality,
+                    'confidence_level': c.confidence_level,
+                })
+        return optimizations
+
+    def _generate_warnings(self, candidates: List[CandidateQuery], opportunities: List[Any]) -> List[str]:
+        """Generate warnings from candidates and opportunities."""
+        warnings = []
+
+        # Check for UNSAFE candidates that were rejected
+        for c in candidates:
+            if not c.validation_passed and c.semantic_safety == 'unsafe':
+                warnings.append(f"Rejected unsafe rewrite: {c.description}")
+            elif c.semantic_risk == 'HIGH':
+                warnings.append(f"High semantic risk: {c.description}")
+
+        # Check for advisory opportunities
+        for opp in opportunities:
+            severity = getattr(opp, 'severity', None)
+            evidence = getattr(opp, 'evidence', '')
+            if severity == 'LOW' and 'advisory' in evidence.lower():
+                warnings.append(f"Advisory: {evidence}")
+
+        return warnings
+
+    def optimize(self, sql: str, enable_actual_execution: Optional[bool] = None) -> Dict[str, Any]:
+        """
+        Optimize a SQL query by generating and ranking candidates.
+
+        Args:
+            sql: Original SQL query
+            enable_actual_execution: Override instance setting for EXPLAIN ANALYZE
+
+        Returns:
+            Dict with original query, cost, and ranked candidates
+        """
+        # Try Calcite first if enabled
+        if self.use_calcite and self.calcite_client and self.calcite_client.is_available():
+            try:
+                return self._optimize_with_calcite(sql)
+            except Exception as e:
+                logger.warning(f"Calcite optimization failed, falling back to built-in: {e}")
+
+        # Fallback to built-in optimization
+        return self._optimize_builtin(sql, enable_actual_execution)
